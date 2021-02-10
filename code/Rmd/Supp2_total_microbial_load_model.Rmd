@@ -1,0 +1,1079 @@
+---
+output: html_document
+bibliography: library.bib
+---
+
+```{r setup, include=FALSE, results='hide'}
+working_dir = '~/workstation/projetos/lib_size'
+knitr::opts_knit$set(
+  root.dir = normalizePath(working_dir)
+) 
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  eval=TRUE
+)
+Sys.setlocale("LC_TIME", "C")
+```
+
+
+
+```{css echo=FALSE}
+body {
+  text-align: justify
+}
+
+p {
+  text-indent: rem;
+}
+.today {
+  position: relative;
+  left: 75%;
+  top: 20px;
+  font-size: 20px;
+}
+h1 {
+  text-align: center;
+}
+# header {
+position: relative;
+top: 500px;
+}
+```
+
+<p class="today">`r format(Sys.time(), '%B, %Y')`</p>
+
+<br /><br />
+
+<div>
+
+<center>
+<h1>
+Supplementary Material 2: Ordinal Regression predicts total microbial load on CFU scale
+</h1>
+</center>
+
+<br />
+
+This supplementary material addresses model building and validation for total microbial load estimation in terms of sample Colony-forming Units (CFU). We address the problem in the $log_{10}$ scale as it is commonly used in the realm of classical microbiology. We propose an ordinal regression strategy within the Bayesian framework, although maximum likelihood estimation is also possible.
+
+## Why ordinal regression?
+
+Colony-forming units are continuous measures. However, in classical microbiology, the ability to quantify microbial abundance has limited resolution: values differ mainly in orders of magnitude, and it is difficult to state replicable differences within the same magnitude range. Hence, decision-making based on such data relies mostly on logarithmic differences, and values such as $2*10^3$ and $3*10^3$ are often treated as approximately equal. The effect of this "partial discretization" of the outcome space impacts the assumptions of most common regression techniques. Ordinary linear regression is not robust to outliers or high-leverage points, assuming the Gaussian response $Y|X_1$ is a simple shift from $Y|X_2$ [@Harrel2015]. Quantile regression is another option but it assumes the distribution of the outcome to be continuous. These challenges hamper the modeling of CFU values and are illustrated with second-order polynomial fits in Figure 1.
+
+
+<br />
+
+
+```{r load_functions}
+source('code/R/general_functions.R')
+suppressPackageStartupMessages({
+  library(patchwork)
+  library(brms)
+  library(rms)
+  library(tidybayes)
+  library(ggridges)
+  library(furrr)
+  library(modelr)
+  library(latex2exp)
+})
+
+# other dependencies: scales, DescTools, caret, future
+
+```
+
+```{r load_data}
+# SEED = sample(1:100000, 1)  
+SEED = 1413  # to reproduce exactly
+REFIT <- FALSE
+ISSUE <- "supp2_total_microbial_load_model"
+output_dir <- str_glue("output/supp_material/{ISSUE}")
+check_dir(output_dir)
+theme_set(theme_pubr())
+
+phylo <- readRDS('data/normalized/phyloseq.rds')
+```
+
+
+```{r f1_standard_linear_regression, fig.cap=figure1_caption}
+figure1_caption = "Figure 1. Common regression techniques for estimation of microbial load as a function of library size. OLS regression is shown in blue, and quantile (median) regression in red. A small vertical jittering of the points was used to avoid overplotting."
+
+all_data <- data.frame(sample_data(phylo)) %>%
+  mutate(
+    cfu_ranges = factor(total_cfu, ordered = TRUE),
+    lib_size = log10(lib_size + 1)
+  )
+
+set.seed(SEED)
+training_index <- caret::createDataPartition(
+  all_data$cfu_ranges, p = 0.9, list = FALSE
+)
+
+df <- all_data[training_index, ]
+df_test <- all_data[-training_index, ]
+
+set.seed(SEED)
+linear_reg_plot <- ggplot(df, aes(total_cfu, 10^lib_size)) +
+  geom_jitter(width = 0.05, height = 0, pch = 21,
+              size = 3,
+              color = 'gray20', fill = 'gray60') +
+  yscale('log10', .format = TRUE) +
+  xscale('log10', .format = TRUE) +
+  labs(x = "Total CFU", y = "# reads") +
+  theme(axis.title = element_text(face = 'bold', color = 'gray20')) +
+  geom_smooth(aes(group=1), method = 'lm',
+              formula = y ~ poly(x, 2), size = 1.2)
+
+set.seed(SEED)
+linear_reg_plot_inv <- ggplot(df, aes(10^lib_size, total_cfu)) +
+  geom_jitter(width = 0, height = 0.05, pch = 21,
+              size = 3,
+              color = 'gray20', fill = 'gray60') +
+  yscale('log10', .format = TRUE) +
+  xscale('log10', .format = TRUE) +
+  labs(y = "Total CFU", x = "# reads") +
+  theme(axis.title = element_text(face = 'bold', color = 'gray20')) +
+  geom_smooth(aes(group=1), method = 'lm',
+              formula = y ~ poly(x, 2), size = 1.2)
+
+check_dir("output/main_text_figures/fig2")
+saveRDS(linear_reg_plot, "output/main_text_figures/fig2/fig2c.rds")
+saveRDS(linear_reg_plot_inv, "output/main_text_figures/fig2/fig2e.rds")
+
+saveRDS(df, "output/supp_material/supp2_total_microbial_load_model/df_training.rds")
+saveRDS(df_test, "output/supp_material/supp2_total_microbial_load_model/df_testing.rds")
+
+linear_reg_plot_inv +
+  geom_quantile(quantiles = 0.5,
+                formula = y ~ poly(x, 2),
+                color = "red",
+                linetype = "longdash")
+```
+
+<br /><br />
+
+We show library size on the $log_{10}$ scale (and add a pseudocount of 1 to avoid $log_{10}(0)$). The OLS regression ignores the monotonic, stepwise nature of the relationship between microbial load and library size. Notice the predicted values are not bounded in any way. Higher values of library size will yield estimates well above $10^6$ CFU, which is unrealistic given PCR saturation (see Methods). 
+
+The present prediction task, therefore, requires alternatives that are (1) robust to small variations in predictors and response, (2) capable of handling upper- and lower-bounded outcome space, and (3) that respect the monotonic relationship between microbial load and NGS reads in a stepwise fashion. This set of characteristics makes ordinal regression a natural option for predictive modeling.
+
+## Cumulative Probability Model predicts Total Microbial CFU
+
+Here we describe the proposed _cumulative probability model_ (CPM), also called _proportional odds_ (PO) model. Formal introductions to ordinal regression are provided in [@Burkner2019; @Liu2017a; @Harrel2015; @McElreath2015]. Alternatives to CPM include sequential models and adjacent category models, which we avoid to rely on the interpretability of CPM. Briefly, the model setting is similar to the one in standard (multinomial) logistic regression with $K$ possible outcomes (classes), except that now the log-odds are based on cumulative probabilities. For each class $c_k \text{ for }k \in \{1, 2, ..., K-1\}$:
+
+$$\log{\frac{{\Pr(Y \leq c_k)}}{1-\Pr(Y \leq c_k)}} = \alpha_k - \psi$$
+
+$$\psi = \beta_1 X_1 + \beta_2 X_2 + \dots + \beta_m X_m$$
+
+The term $\alpha_k$ is the cutpoint associated with the class $c_k$, and the subtracted linear model is left without a standard intercept for identifiability (no $\beta_0$). The subtraction ensures positive coefficients are associated with higher outcome values. When dealing with $K$ total classes, we model explicitly only $K-1$ because the last one is completely determined given a sum-to-one constraint, _i.e._, $\Pr(Y \leq c_K) = 1$. Note that as we are using only library size as predictor, here $\psi = \beta_1 X_1$. Once the model is fitted, one can recover class probabilities as well as expected values conditional on data:
+
+$$\Pr(Y = c_k\ |\ X=x)  = \Pr(Y \leq c_k\ |\ X=x) - \Pr(Y \leq c_{k - 1}\ |\ X=x)  $$
+$$\mathop{\mathbb{E}}[Y|X=x] = \sum_{k=1}^{K}{c_k\ Pr(Y = c_k\ |\ X=x)}$$
+
+Calculating conditional expectations may not make sense in many cases (_e.g._ when the response has no continuous interpretation such as $Y \in \{small,\ medium,\ large\}$). Here, on the other hand, expected values may be as interpretable as the classes themselves: when modeling classes of CFU values, we may predict relatively high probabilities to $Y = 1*10^1$ and $Y = 1*10^2$, for example. In such a case, their weighted average has a clear biological meaning: the expected CFU value is likely to lie between $1*10^1$ and $1*10^2$. While minimizing the probability of error, the class of highest probability (CHP, the most likely outcome) may suffer in terms of performance measures such as mean squared errors.
+
+### Checking Ordinality Assumption
+
+The main assumption behind the PO model is that the outcome behaves in ordinal fashion with respect to predictors [@Harrel2015]. Although Figure 1 suggests monotonicity in the relationship between library size and CFU magnitudes, it is useful to plot stratified averages of the covariate according to levels of the outcome and compare the observations with the model-implied values. We use the function `plot.xmean.ordinaly` from the `rms` package to construct Figure 2.
+
+```{r f2_ordinality_assumption, fig.cap=figure2_caption}
+figure2_caption <- "Figure 2. Checking ordinality assumption."
+plot.xmean.ordinaly2(`CFU` ~ `log10( Library Size )`, 
+                    data = df %>%
+                      rename(
+                        # just to make better-looking axes labels :)
+                        `CFU` := cfu_ranges,
+                        `log10( Library Size )` := lib_size
+                      ), 
+                    pch = 19, ylim = c(1, 5))
+```
+
+Connected solid dots represent the library size averages ($log_{10}$ scale) stratified by each CFU magnitude level. Assuming that PO holds, the dashed line is the estimated expected value of library size given each value of magnitude (_i.e._, estimated $\mathop{\mathbb{E}}[\ \mathcal{W}\ |\ Q=k]$). As the sample means virtually follow the model-implied expectations (almost complete overlap between dashed and solid lines), the graph suggests no major departures from ordinality assumption.
+
+
+### Model specification
+
+Let $Y_{i}$ denote the total microbial load (in CFU scale) from the $i^{th}$ sample. Given our serially-diluted samples, we only observe $K=5$ abundance values such that $Y_i$ takes values $c \in \{c_1, c_2, \dots, c_5\} = \{0.84 \times 10^2,\ 0.84 \times 10^3, \dots ,\ 0.84 \times 10^6\}$. We then define the model:
+
+$$
+Y_{i} \thicksim \text{Categorical}( \boldsymbol{ p_{i} } ) \quad \boldsymbol{ p_{i} } = (p_{i1}, p_{i2}, p_{i3}, p_{i4}, p_{i5})^T \\ 
+p_{ik} = \text{Pr}(\ Y_i = c_k \ ) = \text{Pr}(\ Y_i \leq\ c_k \ ) - \text{Pr}(\ Y_i \leq\ c_{k-1}\ ) \quad \text{for} \quad 1 < k < 5 \\
+p_{i1} = \text{Pr}(\ Y_i \leq\ c_1 \ ) \\ 
+p_{i5} = 1 - \text{Pr}(\ Y_i \leq\ c_4 \ ) \\
+\text{logit}[\ \text{Pr}(\ Y_i \leq\  c_k \ )\ ] = \phi_{ik} \quad , \quad \text{for } k = 1, \dots ,4 \\
+\phi_{ik} = \alpha_{k} - \beta \cdot x_{i} \\
+\alpha_{k} \thicksim \mathcal{N}(0, 5) \quad, \quad \beta \thicksim \mathcal{N}(0, 5)
+$$
+
+where $x_i$ denotes the library size (total number of reads) for the observation $i$. We choose weakly-informative priors for $\alpha_k$ and $\beta$ with no preference for any particular class $c_k$.
+This generative model for the observed abundances $Y_i$ is a case of ordinal logistic regression (McCullagh, 1985; Harrell, 2015). We use a logit link over the linear predictor $\phi_{ik}$ to estimate cumulative probabilities, i.e., $\text{logit}[\text{Pr}(Q_i \leq c_k\ |\ X = x_i)] = \psi_{ik} \implies \text{Pr}(Y_i \leq c_k\ |\ X = x_i) = \frac{1}{1 + \exp(-\psi_{ik})}$. The estimated cumulative probabilities originate the categorical parameters, and the resulting distribution then generates the observed data.
+The linear predictor $\psi_{ik}$ has two unknown parameters (for which we have placed weakly-informative priors): the intercepts $\alpha_k$ and the slope $\beta$. The intercepts are often called cutpoints as they represent the intersections between observable categories on the cumulative logit scale [@Agresti2015]. The negative-valued slope arises naturally from the PO model derivation with latent continuous variable motivation. It also guarantees intuitive interpretations: positive values indicate a positive predictor effect towards higher categories [@McElreath2015]. The ordinal model also allows going beyond conditional (cumulative) class probabilities to estimate conditional expectations, quantiles, and tail probabilities [@Harrel2015]. This is a major advantage of CPMs over other more commonly used methods such as linear and quantile regression [@Liu2017a]. We fitted the model using brms and Stan [@Burkner2017; @Carpenter2017].
+
+### Prior Predictive Check
+
+The weakly-informative priors are on the scale of log-odds and the ordering of cutpoints is enforced by the model. Such settings are constructed in order not to favor any specific magnitude $k$ _a priori_ - although class-specific priors are also possible. The fit below is performed ignoring the likelihood - the data information. 
+
+<br />
+
+```{r prior_pred_check1}
+
+inits_mags = list(
+  `Intercept[1]` = -1, `Intercept[2]` = 0.2,
+  `Intercept[3]` = 1, `Intercept[4]` = 1.2, `lib_size` = 0
+)
+
+
+inits_mags_list = list(inits_mags, inits_mags, inits_mags, inits_mags)
+
+prior_ma <- prior(normal(0, 5), class = "b") +
+  prior(normal(0, 5), class = "Intercept")
+
+if (isTRUE(REFIT)) {
+  fit_prior <- brm(
+    cfu_ranges ~ lib_size, data = df,
+    prior = prior_ma,
+    chains = 4, cores = 4,
+    iter = 4000,
+    inits = inits_mags_list, 
+    family = cumulative(link = 'logit', threshold = 'flexible'),
+    seed = SEED,
+    # avoid divergent transitions (about 3-5 with adapt_delta = 0.8)
+    control = list(adapt_delta = 0.85),  
+    sample_prior = "only",
+    refresh = 0
+  )
+  saveRDS(
+    fit_prior,
+    str_glue("{output_dir}/fit_prior.rds")
+  )
+} else{
+  fit_prior <- readRDS(
+    str_glue("{output_dir}/fit_prior.rds")
+  )
+}
+
+
+fit_prior
+```
+
+<br /><br />
+
+The model fit demonstrates the monotonicity of the cutpoints (here as `Intercept[k]`). Figure 3 shows the actual densities for the parameters (upper panels) as well as the prior predictive distribution behavior (lower panel).
+
+<br />
+
+```{r f3_prior_pred_check, fig.width=12, fig.height=8, fig.cap=figure3_caption}
+figure3_caption = "Figure 3. Prior-predictive check indicates incorporation of weak prior information."
+
+df_prior_check <- tidy_draws(fit_prior) %>%
+  pivot_longer(
+    cols = c(contains("Intercept"), "b_lib_size")
+  )
+p1_prior_check <- df_prior_check %>%
+  filter(name != "b_lib_size") %>%
+  ggplot(aes(value, fill = name )) +
+  geom_density() +
+  scale_fill_ordinal(
+    alpha = .5,
+    end = .45,
+    labels = list(
+      "b_Intercept[1]" = latex2exp::TeX("$\\alpha_1$"),
+      "b_Intercept[2]" = latex2exp::TeX("$\\alpha_2$"),
+      "b_Intercept[3]" = latex2exp::TeX("$\\alpha_3$"),
+      "b_Intercept[4]" = latex2exp::TeX("$\\alpha_4$"),
+      "b_Intercept[5]" = latex2exp::TeX("$\\alpha_5$")
+    )
+  ) +
+  labs(x = "Cutpoints distributions",
+       fill = "Cutpoints") +
+  theme(legend.position = 'right')
+p2_prior_check <- df_prior_check %>%
+  filter(name == "b_lib_size") %>%
+  ggplot(aes(value, fill = name )) +
+  geom_density() +
+  scale_fill_ordinal(
+    alpha = .5, end = .45,
+    labels = list("b_lib_size" = latex2exp::TeX("$\\beta$"))
+  ) +
+  labs(x = latex2exp::TeX("$\t\t\\beta$"),
+       fill = "Effect size") +
+  theme(legend.position = 'right')
+
+prior_check_bars <- pp_check(fit_prior, type = "bars", nsamples = 500) +
+  labs(x = "Magnitude")
+
+( p1_prior_check | p2_prior_check ) / prior_check_bars +
+  plot_annotation(title = "Prior Predictive Check")
+```
+
+<br /><br />
+
+The single prior distribution for the cutpoints yields densities that are mostly overlaid, but with slightly increasing locations and high variance. Little information is assumed for the effect of the library size as well. The prior predictive distribution $y_{rep}$ captures the overall structure of the data ($y$) without ruling out most of the outcome space. Notice we have $K-1 = 4$ cutpoints for $5$ possible values of magnitude.
+
+### Posterior Predictive Check
+
+Next, we fit the full model (_i.e._ include the likelihood). We observed no signs of lack of convergence in the MCMC algorithm.
+
+<br />
+
+```{r fit_first_model}
+if (isTRUE(REFIT)) {
+  fit <- update(fit_prior, sample_prior = "no", seed = SEED, 
+                control = list(adapt_delta = 0.85), 
+                cores = 4, chains = 4,
+                refresh = 0)
+  saveRDS(fit, "output/supp_material/supp2_total_microbial_load_model/fit.rds")
+} else{
+  fit <- readRDS("output/supp_material/supp2_total_microbial_load_model/fit.rds")
+}
+
+fit
+```
+
+<br />
+
+Figure 4 shows the posterior predictive check. The cutpoints and effect of library size are updated to values in the positive real line. The posterior means are well separated. The data (lower panel, $y$) is well captured by the posterior predictive distribution ($y_{rep}$), although there is considerably more variance for the higher classes.
+
+<br />
+
+
+```{r f4_posterior_pred_check, fig.width=12, fig.height=8, fig.cap=figure4_caption}
+
+figure4_caption = "Figure 4. Posterior-predictive check suggests the data-generating process is well captured by the model."
+
+df_posterior_check <- tidy_draws(fit) %>%
+  pivot_longer(
+    cols = c(contains("Intercept"), "b_lib_size")
+  )
+p1_posterior_check <- df_posterior_check %>%
+  filter(name != "b_lib_size") %>%
+  ggplot(aes(value, fill = name )) +
+  geom_density() +
+  scale_fill_ordinal(
+    alpha = .5,
+    end = .45,
+    labels = list(
+      "b_Intercept[1]" = "k1",
+      "b_Intercept[2]" = "k2",
+      "b_Intercept[3]" = "k3",
+      "b_Intercept[4]" = "k4"
+    )
+  ) +
+  labs(x = "Cutpoints distributions",
+       fill = "Cutpoints") +
+  theme(legend.position = 'right')
+p2_posterior_check <- df_posterior_check %>%
+  filter(name == "b_lib_size") %>%
+  ggplot(aes(value, fill = name )) +
+  geom_density() +
+  scale_fill_ordinal(
+    alpha = .5, end = .45,
+    labels = list("b_lib_size" = latex2exp::TeX("$\\beta$"))
+  ) +
+  labs(x = latex2exp::TeX("$\t\t\\beta$"),
+       fill = "Effect size") +
+  theme(legend.position = 'right')
+
+posterior_check_bars <- pp_check(fit, type = "bars", nsamples = 1000) +
+  labs(x = "Abundance (CFU)") +
+  theme(axis.title = element_text(face = "bold", color = 'gray20')) +
+  scale_x_discrete(labels = scales::scientific(0.84 * 10^(2:6)),
+                   limits = 1:5)
+
+
+( p1_posterior_check | p2_posterior_check ) / posterior_check_bars +
+  plot_annotation(title = "Posterior Predictive Check")
+```
+
+
+<br /><br />
+
+
+### CFU Predictions 
+
+Given the cumulative probability model structure, we can now recover the CFU magnitude probabilities as well as conditional expectations. We draw fitted values from the (multidimensional) posterior predictive distribution and show the distributions of magnitude probabilities (Figure 5A). These probabilities drive the conditional mean estimates (Figure 5B). Figure 5C shows the predicted values as densities for each outcome value, and Figure 5D replicates the previous OLS regression for comparison.
+
+<br />
+
+```{r aux_functions}
+# define aux functions
+get_expecs_data <- function(fitted_data) {
+  fitted_data %>%
+    mutate(
+      magnitude = as.numeric(as.character(.category)),
+      magnitude = levels(df$cfu_ranges)[magnitude] %>% as.numeric()
+    ) %>%
+    group_by(.row, lib_size, .draw) %>%
+    summarise(
+      expectation = sum(magnitude * .value)
+    ) 
+}
+
+get_pred_int_data <- function(fit, newdata = NULL) {
+  .levs <- as.numeric(levels(fit$data$cfu_ranges))
+  if (is_null(newdata)) {
+    d <- data.frame(lib_size = seq_range(c(0, 5), n = 300))
+  } else {
+    d <- newdata
+  }
+  data.frame(
+    predictive_interval(fit, newdata = d, prob = 0.95),
+    d
+  ) %>%
+    mutate(.lower = .levs[as.numeric(as.character(X2.5.))],
+           .upper = .levs[as.numeric(as.character(X97.5.))]) 
+  
+}
+get_chp <- function(.fitted_data, .group) {
+  .fitted_data %>%
+    median_qi() %>%
+    group_by({{.group}}) %>%
+    top_n(1, wt = .value) %>%
+    ungroup %>%
+    mutate(chp = as.numeric(.category))
+}
+```
+
+
+```{r f5_merginal_effects, fig.width=15, fig.height=9, fig.cap=figure5_caption}
+
+figure5_caption <- "Figure 5. Draws from posterior distribution with respective magnitude probabilities and derived conditional expectations. Figure 1 is reproduced to facilitate comparison."
+
+predicted_data = tibble(lib_size = df$lib_size) %>%
+  add_predicted_draws(fit, n = 500, seed = SEED)
+.new_data <- df %>%
+  data_grid(
+    lib_size = seq_range(c(0, 5), n = 200),
+  )
+fitted_data <- .new_data %>%
+  add_fitted_draws(fit, n = 200, seed = SEED) %>%
+  ungroup %>%
+  mutate(
+    .category = levels(df$cfu_ranges)[as.numeric(.category)]
+  ) %>%
+  group_by(lib_size, .row, .category)
+
+df_for_plotting <- df %>%
+  mutate(
+    lib_size = 10^lib_size,
+    total_cfu = total_cfu %>% ordered()
+  )
+
+posterior_predictive_distribution <- predicted_data %>%
+  ungroup() %>%
+  mutate(lib_size = 10^lib_size,
+         total_cfu = levels(df$cfu_ranges)[.prediction] %>% as.numeric()) %>%
+  ggplot(aes(x = lib_size, y = total_cfu, fill = 0.5 - abs(0.5-..ecdf..))) +
+  stat_density_ridges(geom = "density_ridges_gradient",
+                      aes(y = factor(total_cfu, ordered = TRUE)),
+                      calc_ecdf = TRUE,
+                      bandwidth = .1, scale = .925) +
+  scale_fill_viridis_c(name = "Tail probabilities", direction = -1,
+                       limits = c(0, .55)) +
+  xscale('log10', .format = TRUE) +
+  labs(y = "Magnitude", x = "Library Size (# reads)") +
+  theme(axis.title = element_text(face = 'bold', color = 'gray20'),
+        legend.position = "right") +
+  geom_jitter(data = df_for_plotting, 
+              aes(lib_size, total_cfu, color = "Observed Data"), 
+              inherit.aes = F,
+              width = 0, height = .05, fill = "gray40",
+              pch = 21, size = 2) +
+  scale_color_manual(values = "gray20", name = NULL) +
+  scale_y_discrete(breaks = 1:6) +
+  annotate("text", x = 2*10^2.5, y = 4.5,
+           label = "Posterior Predictive\nDistribution", 
+           fontface = 'bold', color = "gray40")
+
+posterior_probabilities <- fitted_data %>%
+  median_qi() %>%
+  ggplot(aes(10^lib_size, .value,
+             color = .category, fill = .category)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = .lower, 
+                  ymax = .upper, color = NULL), 
+              alpha = .35, show.legend = FALSE) +
+  geom_rug(data = df, 
+           aes(x = 10^lib_size, color = cfu_ranges),
+           show.legend = FALSE, inherit.aes = FALSE) +
+  theme(axis.title = element_text(face = "bold", color = 'gray20', size = 10),
+        legend.position = "top",
+        legend.justification = c(0, 0)
+  ) +
+  labs(y = "Probability",
+       x = "Library Size (#reads)",
+       fill = NULL, color = NULL) +
+  xscale('log10', TRUE) +
+  guides(color = guide_legend(nrow = 2))
+
+class_of_highest_probs <- get_chp(.fitted_data = fitted_data,
+                                  .group = lib_size)
+
+predictive_interval_data <- data.frame(
+  predictive_interval(fit, newdata = .new_data, prob = .95),
+  .new_data
+) %>%
+  mutate(
+    .lower = as.numeric(as.character(X97.5.)),
+    .upper = as.numeric(as.character(X2.5.)), 
+    .lower = levels(df$cfu_ranges)[.lower] %>% as.numeric(),
+    .upper = levels(df$cfu_ranges)[.upper] %>% as.numeric()
+  )
+set.seed(SEED)
+conditional_expectations <- fitted_data %>%
+  mutate(
+    magnitude = as.numeric(as.character(.category))
+  ) %>%
+  group_by(.row, lib_size, .draw) %>%
+  summarise(expectation = sum(magnitude * .value)) %>%
+  median_qi() %>%
+  ggplot(aes(x = 10^lib_size)) +
+  geom_line(aes(y = expectation), size = 1.2) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper),
+              fill = "#0089FF", alpha = 1/5) +
+  geom_jitter(data = df, 
+              aes(x = 10^lib_size, y = total_cfu),
+              inherit.aes = F, size = 3,
+              width = 0, height = .05, pch = 21,
+              color = 'gray20', fill = 'gray60') +
+  geom_line(data = class_of_highest_probs,
+            aes(y = chp), color = "red") +
+  geom_ribbon(data = predictive_interval_data, 
+              aes(ymin = .lower, 
+                  ymax = .upper),
+              alpha = 1/4, fill = "gray20",
+  ) +
+  geom_hline(yintercept = 10^(2:6),
+             alpha = .2, size = .3,
+             linetype = "dashed") +
+  labs(
+    y = "Microbial load (CFU)", x = "Library Size (# reads)"
+  ) +
+  theme(
+    legend.position = 'right',
+    axis.title = element_text(face = "bold", color = 'gray20')
+  ) +
+  yscale('log10', TRUE) +
+  xscale('log10', TRUE)
+
+(
+  (posterior_probabilities/ conditional_expectations + ggtitle("Ordinal Logistic Regression")) |
+    ( (posterior_predictive_distribution) / ggpar(linear_reg_plot_inv, title = "Linear/Quantile Regression") )
+  
+) + plot_annotation(tag_levels = "A")
+```
+
+<br /><br />
+
+Note that the estimated mean from the ordinal model follows the stepwise fashion of the data, is bounded within the observed outcome space, and shows similar behavior to standard regression techniques in regions of overlapping read counts. In the CPM, however, the variation is driven by the logistic estimation of magnitude probabilities, rather than direct estimation of expectations. Additionally, the ordinal model properly shows increased uncertainty where there is not much data, suggesting confidence intervals from linear regression may be actually overly confident. Class probabilities are mostly dominant in the non-overlapping regions of the data but still render reasonable posterior predictive distribution. 
+
+### Model Validation
+
+```{r}
+K = 10
+```
+
+We further validate the model using `r K`-fold cross-validation to estimate its overall predictive performance, and then use held-out data as a test set.
+
+
+
+#### `r K`-fold cross-validation
+
+```{r cv_functions}
+# cv functions
+cv_fit <- function(partition_index, compiled_fit, df) {
+  library(Rcpp)
+  
+  .columns <- c("cfu_ranges", "lib_size", "total_cfu", "sample")
+  # partition data
+  validation_training <- df[-partition_index, .columns]
+  validation_testing <- df[partition_index, .columns]
+  # fit sub-model
+  
+  fold_fit <- update(
+    compiled_fit, 
+    newdata = validation_training,
+    chains = 2, cores = 2, iter = 2000, seed = SEED, 
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # compose output with everything you've done
+  output <- list(
+    data = list(train = validation_training, test = validation_testing),
+    fit = fold_fit
+  )
+  return(output)
+}
+get_predictions <- function(.fit, .newdata) {
+  
+  .pred_ints <- get_pred_int_data(fit = .fit, newdata = .newdata)
+  .fitted_data <- data.frame(
+    .newdata, 
+    .lower_bound = .pred_ints$.lower,
+    .upper_bound = .pred_ints$.upper
+  ) %>%
+    add_fitted_draws(.fit, n = 300,
+                     seed = SEED)
+  
+  class_of_highest_prob <- get_chp(.fitted_data = .fitted_data,
+                                   .group = sample) %>%
+    mutate(chp = as.numeric(levels(df$cfu_ranges)[chp])) %>%
+    select(sample, lib_size, cfu_ranges, total_cfu, 
+           chp, .lower_bound, .upper_bound)
+  
+  expecs <- .fitted_data %>%
+    ungroup() %>%
+    mutate(
+      .category = levels(cfu_ranges)[as.numeric(.category)],
+      magnitude = as.numeric(as.character(.category))
+    ) %>%
+    group_by(sample, .row, lib_size, .draw) %>%
+    summarise(expecs = sum(magnitude * .value)) %>%
+    median_qi() %>%
+    ungroup() %>%
+    select(sample, expecs)
+  
+  .predictions <- left_join(class_of_highest_prob, expecs, by = "sample")
+  return(.predictions)
+} 
+get_performance <- function(.predictions, .test_data) {
+  .output <- .predictions %>%
+    ungroup() %>%
+    mutate(
+      true_value = round(as.numeric(as.character( cfu_ranges ))),
+      chp = round(as.numeric(as.character( chp )))
+    ) %>%
+    summarise(
+      expec_malr = mean( abs(log10(expecs) - log10(true_value)) ),
+      expec_mae_r = mean( abs(expecs - true_value) / true_value ),
+      expec_mae_n = mean( abs( expecs - true_value ) / ( true_value * log10(true_value) ) ),
+      chp_malr = mean( abs(log10(chp) - log10(true_value)) ),
+      chp_mae_r = mean( abs(chp - true_value) / true_value ),
+      chp_mae_n = mean( abs( chp - true_value ) / ( true_value * log10(true_value) ) ),
+      chp_overall_accuracy = mean(chp == true_value),
+      .coverage = mean(true_value >= .lower_bound & true_value <= .upper_bound),
+      chp_spearman = cor(chp, true_value, method = "spearman"),
+      expec_spearman = cor(expecs, true_value, method = "spearman"),
+      chp_somers = DescTools::SomersDelta(chp, true_value)
+    )
+  return(.output)
+}
+plot_cond_expecs <- function(fitted_data, class_of_highest_probs, 
+                             points_df,
+                             predictive_interval_data,
+                             point_color = "gray40") {
+  fitted_data %>%
+    mutate(
+      magnitude = as.numeric(as.character(.category))
+    ) %>%
+    group_by(.row, lib_size, .draw) %>%
+    summarise(expectation = sum(magnitude * .value)) %>%
+    median_qi() %>%
+    ggplot(aes(x = 10^lib_size)) +
+    geom_line(aes(y = expectation), size = 1.2) +
+    geom_ribbon(aes(ymin = .lower, ymax = .upper),
+                fill = "#0089FF", alpha = 1/5) +
+    geom_jitter(data = points_df, 
+                aes(x = 10^lib_size, y = total_cfu),
+                inherit.aes = F, size = 3,
+                width = 0, height = .05, pch = 21,
+                color = 'gray20', fill = point_color) +
+    geom_line(data = class_of_highest_probs,
+              aes(y = chp), color = "red") +
+    geom_ribbon(data = predictive_interval_data, 
+                aes(ymin = .lower,
+                    ymax = .upper),
+                alpha = 1/4, fill = "gray20",
+    ) +
+    geom_hline(yintercept = 10^(2:6),
+               alpha = .2, size = .3,
+               linetype = "dashed") +
+    labs(
+      y = "Microbial load (CFU)", x = "Library Size (# reads)"
+    ) +
+    theme(
+      legend.position = 'right',
+      axis.title = element_text(face = "bold", color = 'gray20')
+    ) +
+    yscale('log10', TRUE) +
+    xscale('log10', TRUE)
+}
+
+cv_assess <- function(fold_fit) {
+  .fit <- fold_fit$result$fit
+  .test_data <- fold_fit$result$data$test
+  
+  .plotting_data <- bind_rows(
+    data.frame() %>%
+      data_grid(lib_size = seq_range(c(0, 5), n = 300),
+                total_cfu = NA, cfu_ranges = NA),
+    .test_data %>% 
+      select(lib_size, total_cfu, cfu_ranges)
+  )
+  
+  .fitted_data <- .plotting_data %>%
+    add_fitted_draws(.fit, seed = SEED, n = 300) %>%
+    ungroup() %>%
+    mutate(
+      .category = levels(df$cfu_ranges)[as.numeric(.category)]
+    ) %>%
+    group_by(lib_size, total_cfu, cfu_ranges, .row, .category)
+  
+  # .expectations_data <- get_expecs_data(fitted_data = .fitted_data)
+  
+  .pred_interval_data <- get_pred_int_data(fit = .fit)
+  .class_of_highest_probs <- get_chp(.fitted_data = .fitted_data,
+                                     .group = lib_size)
+  
+  .conditional_expectations <- plot_cond_expecs(
+    fitted_data = .fitted_data,
+    class_of_highest_probs = .class_of_highest_probs,
+    points_df = .test_data, 
+    predictive_interval_data = .pred_interval_data,
+    point_color = "blue"
+  )
+  
+  .predictions <- get_predictions(.fit = .fit, .newdata = .test_data)
+  .performance <- get_performance(.predictions = .predictions,
+                                  .test_data = .test_data)
+  .performance_plots <- .performance %>%
+    pivot_longer(cols = everything()) %>%
+    ggplot(aes(name, value)) +
+    geom_pointrange(aes(ymin = 0, ymax = value, color = name),
+                    position = position_dodge(width = .5)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "top") +
+    labs(x = NULL, color = NULL)
+  
+  output <- list(
+    .data = list(
+      .fitted_data = .fitted_data 
+    ),
+    .plots = list(
+      .cond_expecs_plots = .conditional_expectations,
+      .performance_plots = .performance_plots
+    ),
+    .predictions = .predictions,
+    .performance = .performance,
+    .fold_fit = fold_fit$result$fit
+  )
+  return(output)
+}
+join_plots <- function(performance_measures) {
+  .performance <- ggarrange(
+    plotlist = imap(
+      performance_measures, ~.x$result$.plots$.performance_plots + 
+        labs(title = .y) +
+        theme(axis.text.x = element_text(angle = 35, hjust = 1, size = 8))
+    ),
+    nrow = 4, ncol = 3, common.legend = T
+  )
+  .cond_expecs <- ggarrange(
+    plotlist = imap(
+      performance_measures,  
+      ~ .x$result$.plots$.cond_expecs_plots + labs(title = .y)),
+    nrow = 4, ncol = 3, common.legend = T
+  )
+  
+  .output = list(
+    .performance = .performance, .cond_expecs = .cond_expecs
+  )
+  return(.output)
+}
+join_performance <- function(performance_measures) {
+  .errors_df <- map(performance_measures, ~ .x$result$.performance) %>%
+    plyr::ldply(rbind, .id = ".fold")
+  return(.errors_df)
+}
+join_cv_folds <- 
+  function(performance_measures, out_types = c("plots", "performance"), cv_type = "kfold") {
+    .results <- list()
+    for (.type in out_types) {
+      if (.type == "plots") {
+        .results[['.plots']] <- join_plots(performance_measures = performance_measures)
+      } else if (.type == "performance") {
+        .results[['.performance']] <- join_performance(
+          performance_measures = performance_measures
+        )
+      } else {
+        stop("Only types 'plots' and 'performance' implemented this far :).")
+      }
+    }
+    return(.results)
+  }
+```
+
+
+```{r kfold_run}
+
+if (isTRUE(REFIT)) {
+  set.seed(SEED)
+  folds <- caret::createFolds(df$cfu_ranges, k = K)
+  # Warning: pretty heavy computation, just so you know,
+  # took about 2 hours with 12 threads and 64gb RAM (although used ~7gb ram 'only')
+  # this might benefit from the 'jobs' tab in RStudio
+  future::plan(multiprocess, workers = K)
+  kf_cv_fits <- future_map(folds, safely(cv_fit),
+                           compiled_fit = fit,
+                           df = df,
+                           .progress = FALSE) # change this if curious like me
+  future::plan(sequential)
+  saveRDS(kf_cv_fits, str_glue("{output_dir}/kfold_cv_fits.rds"))
+} else {
+  kf_cv_fits <- readRDS(str_glue("{output_dir}/kfold_cv_fits.rds"))
+}
+
+if (isTRUE(REFIT)) {
+  # Warning 2: this also takes a while :)
+  # I made this "2-step thing" for running cv + assessing results
+  # because I wasn't sure my pc could handle processing both simultaneously
+  future::plan(multiprocess, workers = K)
+  performance_measures <- future_map(kf_cv_fits, safely(cv_assess), 
+                                     .progress = FALSE)  # change this if curious like me
+  future::plan(sequential)
+  saveRDS(performance_measures,
+          str_glue("{output_dir}/kfold_cv_performance_measures.rds"))
+} else {
+  performance_measures <- readRDS(
+    str_glue("{output_dir}/kfold_cv_performance_measures.rds")
+  )
+}
+```
+
+We run `r K`-fold cross-validation and the results are shown below. Figure 6A shows the fitted models with respective fold-specific held-out data. Figure 8B shows the predictive performance measures.
+
+```{r kfold_plot, fig.width=20, fig.height=13, fig.cap=figure6_caption}
+figure6_caption <- str_glue(
+  "Figure 6. {K}-fold cross-validation. (A) CV folds with respective fits and observations. (B) CV performance metrics. 'CHP' denotes predictions based on the Class of Highest Probability. Predictions based on expectations are indicated likewise."
+)
+
+cv_results <- join_cv_folds(performance_measures = performance_measures)
+
+.labels <- list(
+  expec_malr = "MALR\n(expectation)",
+  expec_mae_r = "MAEr\n(expectation)",
+  expec_spearman = "Spearman\n(expectation)",
+  chp_malr = "MALR\n(CHP)",
+  chp_mae_r = "MAEr\n(CHP)",
+  chp_spearman = "Spearman\n(CHP)",
+  chp_overall_accuracy = "Accuracy\n(CHP)",
+  chp_somers = "Dxy\n(CHP)",
+  .coverage = "Coverage\n(CHP)"
+)
+kfold_plot <- cv_results$.performance %>%
+  pivot_longer(cols = -.fold) %>%
+  filter(name %in% names(.labels)) %>%
+  mutate(
+    .bounded = ifelse(
+      name %in% c(
+        "expec_malr", "expec_mae_r",
+        "expec_mae_n", "chp_malr",
+        "chp_mae_r", "chp_mae_n"
+      ),
+      "Unbounded metrics", "Bounded metrics"
+    ),
+    name = factor(as.character(name),
+                  levels = names(.labels),
+                  labels = .labels)
+  ) %>%
+  ggplot(aes(name, value, fill = name)) +
+  geom_boxplot() +
+  scale_fill_discrete(labels = .labels,
+                      breaks = names(.labels)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 15),
+        legend.position = 'bottom',
+        legend.key.size = unit(.9, 'cm'),
+        legend.text = element_text(face = "bold", color = "gray40", size = 14),
+        strip.text = element_text(face = "bold", color = "gray20", size = 14)) +
+  labs(x = NULL, fill = NULL, y = NULL) +
+  facet_wrap(~ .bounded, scales = "free", nrow = 2)
+
+ggarrange(cv_results$.plots$.cond_expecs, kfold_plot,
+          widths = c(.6, .4), labels = "AUTO",
+          common.legend = FALSE)
+```
+
+<br /><br />
+
+
+For visualization, we have split the assessed metrics into bounded between 0 and 1 and unbounded metrics. Bounded metrics based on CHP included the observed coverage of 95% predictive interval (gray bands in Figure 6A), Somers’ Delta (a measure of ordinal association), classification accuracy, and Spearman’s rank correlation. The latter was also assessed for expectation-based predictions. In general, these metrics varied well above 0.9. Notably, the predictive intervals showed 100% coverage, which is likely overconfident. Nonetheless, from figure 6A we can see that most intervals spanned only two abundance classes, suggesting errors occur mainly within one order of magnitude from the true values. Ordinal association, as measured by Somers’ Delta, was consistently greater than 0.95.
+
+Unbounded metrics relied on modified versions of absolute errors, for both CHP- and expectation-based predictions. MALR denotes Mean Absolute Log-Ratio, a measure that captures how predictions miss observed values in terms of orders of magnitude in the $log_{10}$ scale.
+
+$$\text{MALR} = \frac{1}{n}\sum_{i=1}^{n}\mid log_{10}(\hat{y_i}) - log_{10}(y_i) \mid\ =\ \mid log_{10}(\frac{\hat{y_i}}{y_i}) \mid$$
+
+MALR varied during CV below 0.2 for both CHP and expectation. Perhaps more intuitive, we also computed the Mean Absolute Error relative to the true values, capable of measuring absolute errors as proportions of true values.
+
+$$\text{MAEr} = \frac{1}{n}\sum_{i=1}^{n}\frac{ \mid \hat{y_i} - y_i \mid }{y_i}$$
+
+MAEr tended to be lower for CHP-based predictions compared to expectations, both of each never reaching the value of 0.7.
+
+Notice that a MALR value of 1 corresponds to a ratio between predicted and observed values of one order of magnitude in the $log_{10}$ scale. A MAEr of 1 indicates prediction absolute error as large as the true value, which would still be largely insignificant given the logarithmic scale. Overall, the model generates accurate predictions of total microbial load.
+
+### Test-set validation
+
+We perform one final model-validation step, which involves predicting new, unseen samples. What we did was holding out beforehand 10% of the dataset to use for such a task. Figure 7 shows the results.
+
+```{r test_set_validation, fig.width=12, fig.cap=figure7_caption}
+figure7_caption <- "Figure 7, Test-set validation of CPM for total microbial load."
+
+df_test <- df_test %>% select(sample, total_cfu, lib_size, cfu_ranges)
+.preds <- get_predictions(
+  .fit = fit, 
+  .newdata = df_test
+)
+
+test_set_perf <- get_performance(.preds, .test_data = df_test) %>%
+  pivot_longer(cols = everything()) %>%
+  ggplot(aes(name, fill = name)) +
+  geom_hline(yintercept = 1,
+             linetype = "longdash",
+             alpha = .2) +
+  # geom_hline(yintercept = seq(0, 1, .25), linetype = "longdash",
+  #            alpha = .3) +
+  # geom_segment(aes(xend = name, y = 0, yend = 1.1),
+  #              linetype = 'dashed', color = "gray40",
+  #              alpha = .32) +
+  geom_segment(aes(xend = name, y = 0, yend = value,
+                   color = name), size = 1.2,
+               show.legend = FALSE) +
+  theme_bw() +
+  geom_point(aes(y = value), pch = 21,
+             size = 7) +
+  scale_x_discrete(labels = .labels, limits = names(.labels)) +
+  scale_fill_discrete(labels = .labels, limits = names(.labels)) +
+  scale_color_discrete(labels = .labels, limits = names(.labels)) +  
+  theme(legend.position = 'bottom') +
+  labs(y = NULL, x = NULL, fill = NULL) +
+  coord_flip() +
+  guides(color = guide_legend(nrow = 5)) +
+  scale_y_continuous(breaks = seq(0, 1.2, .1))
+
+p <- conditional_expectations +
+  geom_jitter(
+    data = df_test, 
+    width = 0, height = .05,
+    color = "black", size = 3.5,
+    fill = "brown", pch = 21,
+    aes(y = total_cfu)
+  )
+
+model1_test_set <- ggarrange(
+  p, test_set_perf + guides(color = "none"),
+  widths = c(0.6, 0.4),
+  ncol = 2
+)
+
+model1_test_set
+```
+
+Notice the results from cross-validation are mostly replicated. MAEr values below 0.6, and MALR values below 0.2, indicating predictive errors far below the threshold of one order of magnitude. Predictions show high rank correlations as well as ordinal association with observed values. Classification accuracy seems equally satisfactory.
+
+## Tail probabilities
+
+One of the advantages of the CPM model is the richness of its output. Additionally to class probabilities and conditional expectations, one can retrieve tail probabilities as well (for completeness: one can also calculate conditional quantiles). Once we have $Pr(Y_i = c_k\ |\ X=x_i)$, we can calculate the probability of having at least $c_k$, conditional on observing $X = x_i$:
+
+$$
+Pr(Y_i \geq c_k\ |\ X=x_i) = 1 - Pr(Y_i \leq c_{k-1}\ |\ X=x_i) = \sum_{j = k}^{c_K}{Pr(Y_i = c_j\ |\ X=x_i)}
+$$
+
+Notice that here we relax the traditional definition of tail probability ($Pr(Y > y)$) to include the class of interest $c_k$.
+
+Figure 8 shows the estimated tail probabilities. Given a library size, each curve shows the probability of having at least $c_k$ CFU for each abundance value.
+
+```{r f7_tail_probabilities, fig.width=13, fig.height=6, fig.cap=figure8_caption}
+
+figure8_caption <- "Figure 8. Tail probabilities from CPM model."
+
+df_to_plot <- fitted_data %>%
+  filter(lib_size >= 1.5) %>%
+  ungroup %>%
+  pivot_wider(names_from = .category,
+              values_from = .value,
+              id_cols = c("lib_size", ".draw"),
+              names_prefix = "p") %>%
+  mutate(
+    p_at_least_84 = 1, 
+    p_at_least_840 = 1 - p84,
+    p_at_least_8400 = 1 - p840 - p84,
+    p_at_least_84000 = 1 - p8400 - p840 - p84,
+    p_at_least_840000 = 1 - p84000 - p8400 - p840 - p84
+  ) %>%
+  pivot_longer(cols = contains("p_at_least"),
+               values_to = ".value") %>%
+  select(lib_size, name, .draw, .value) %>%
+  group_by(lib_size, name) %>%
+  median_qi()
+
+tail_probs_fit1 <-  df_to_plot %>%
+  ggplot(aes(x = 10^lib_size)) +
+  geom_line(aes(y = .value, color = name), size = 1) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper, fill = name), alpha = .35) +
+  xscale("log10", .format = TRUE) +
+  labs(x = "Library Size (# reads)", y = "Probability",
+       color = NULL, fill = NULL) +
+  theme(
+    axis.title = element_text(face = 'bold', color = 'gray20'),
+    legend.key.size = unit(1.2, 'cm'),
+    legend.text = element_text(size = 15, face = "bold"),
+    legend.position = 'right'
+  ) +
+  scale_color_discrete(labels = map(
+    list(
+      "p_at_least_84" = "$Pr(CFU \\geq 0.84 \\times 10^2)$", 
+      "p_at_least_840" = "$Pr(CFU \\geq 0.84 \\times 10^3)$",
+      "p_at_least_8400" = "$Pr(CFU \\geq 0.84 \\times 10^4)$",
+      "p_at_least_84000" = "$Pr(CFU \\geq 0.84 \\times 10^5)$", 
+      "p_at_least_840000"= "$Pr(CFU \\geq 0.84 \\times 10^6)$"
+    ), ~ TeX(.x) 
+  )
+  ) +
+  guides(fill ='none')
+
+tail_probs_fit1
+
+```
+
+The above calculation may have practical applications. For instance, instead of relying on the most likely outcome of derived expectations, it may be enough to know that a sample has a very high probability of having at least $10^4$ CFU of total microbial load. In cases of high estimation uncertainty, one may derive such a lower bound of high probability as:
+
+$$\text{Lower CFU bound} = \max\limits_{1 \leq k  \leq K} {\{c_k: \text{Pr}(Y_i \geq c_k ) \geq \tau\}}$$
+
+for some large $\tau$ - say 95% for instance. Analogously, one can describe the samples by the probabilities of having _at most_ certain value and hance derive upper bounds of high probabilities:
+
+$$\text{Upper CFU bound} = \min\limits_{1 \leq k  \leq K} {\{c_k: \text{Pr}(Y_i \leq c_k ) \geq \tau\}}$$
+
+In the first case, for each observation $Y_i$ you must have $c_k$ or more CFU with high probability (lower bound). In the second case, for each observation $Y_i$ you must have $c_k$ or less CFU with high probability (upper bound). 
+
+Finally, it is clear that CPMs can generate a wealth of accurate information useful for total microbial load estimation.
+
+<br /><br /><br /><br /><br />
+
+```{r save_main_text_figs, fig.width=16, fig.height=8}
+# save for building main figs
+if (isTRUE(REFIT)) {
+  .path <- "output/main_text_figures/fig3"
+  check_dir(.path)
+  saveRDS(posterior_probabilities, 
+          str_glue("{.path}/posterior_probablities.rds"))
+  saveRDS(posterior_check_bars, 
+          str_glue("{.path}/posterior_check_bars.rds"))
+  saveRDS(conditional_expectations, 
+          str_glue("{.path}/conditional_expectations.rds"))
+  saveRDS(tail_probs_fit1, 
+          str_glue("{.path}/tail_probs_fit1.rds"))
+  
+  .path <- "output/main_text_figures/fig4"
+  check_dir(.path)
+  saveRDS(kfold_plot,
+          str_glue("{.path}/total_microbial_load_kfold.rds"))
+  saveRDS(test_set_perf,
+          str_glue("{.path}/total_microb_load_test_set_performance.rds"))
+}
+
+```
+
+
+## References

@@ -1,0 +1,1276 @@
+---
+output: html_document
+bibliography: library.bib
+---
+
+```{r setup, include=FALSE}
+working_dir = '~/workstation/projetos/lib_size'
+knitr::opts_knit$set(
+  root.dir = normalizePath(working_dir)
+) 
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  eval=TRUE
+)
+Sys.setlocale("LC_TIME", "C")
+```
+
+
+
+```{css echo=FALSE}
+body {
+  text-align: justify
+}
+
+p {
+  text-indent: rem;
+}
+
+.today {
+  position: relative;
+  left: 75%;
+  top: 20px;
+  font-size: 20px;
+}
+h1 {
+  text-align: center;
+}
+# header {
+position: relative;
+top: 500px;
+}
+```
+
+
+<p class="today">`r format(Sys.time(), '%B, %Y')`</p>
+
+<br /><br />
+
+<div>
+
+<center>
+<h1>
+Supplementary Material 3: Ordinal Regression predicts sample absolute bacterial abundance on CFU scale
+</h1>
+</center>
+
+```{r load_functions_and_pkgs}
+source('code/R/general_functions.R')
+
+suppressPackageStartupMessages({
+  library(patchwork)
+  library(brms)
+  library(rms)
+  library(tidybayes)
+  library(ggridges)
+  library(furrr)
+  library(latex2exp)
+  library(modelr)
+})
+```
+
+```{r load_data}
+# SEED <- sample(1:100000, 1)  
+SEED <- 6513  # to reproduce exactly
+REFIT <- FALSE
+ISSUE <- "supp3_mixed_model"
+output_dir <- str_glue("output/supp_material/{ISSUE}")
+check_dir(output_dir)
+theme_set(theme_pubr())
+
+phylo <- readRDS('data/normalized/phyloseq.rds')
+
+```
+
+```{r preprocess_data}
+taxa_of_interest <- c(
+  "Listeria monocytogenes", "Salmonella enterica", "Bacillus cereus",
+  "Staphylococcus aureus", "Staphylococcus epidermidis", "Enterococcus faecalis"
+)
+names(taxa_of_interest) <- names(phylo@sam_data)[3:8]
+
+
+cfu_data <- sample_data(phylo) %>%
+  data.frame() %>%
+  pivot_longer(
+    cols = L_monocytogenes:E_faecalis,
+    names_to = "bacteria",
+    values_to = "cfu"
+  ) %>%
+  select(sample, bacteria, cfu) %>%
+  mutate(
+    cfu = as.numeric(as.character(cfu)),
+    bacteria = taxa_of_interest[
+      as.character(bacteria)
+      ] %>% unname()
+  ) %>%
+  mutate_if(is.factor, as.character)
+ngs_data <-  otu_table(phylo, taxa_are_rows = FALSE) %>%
+  data.frame(sample = str_remove(rownames(.), fixed("Smpl")),
+             check.names = FALSE) %>%
+  pivot_longer(cols = -sample,
+               names_to = "bacteria",
+               values_to = "reads") %>%
+  mutate_if(is.factor, as.character)
+
+all_data <- left_join(cfu_data, ngs_data, by = c("sample", "bacteria")) %>%
+  filter(cfu > 20) %>%
+  mutate(
+    cfu_ranges = factor(cfu, ordered = TRUE,
+                        levels = c(200, 2000, 20000, 200000),
+                        labels = c('2e+02', '2e+03', '2e+04', '2e+05')),
+    log10_reads = log10(reads + 1)
+  )
+class_dict <- c(`1`='2e+02', `2`='2e+03', `3`='2e+04', `4`='2e+05')
+set.seed(SEED)
+training_index <- caret::createDataPartition(
+  all_data$cfu_ranges, p = 0.9, list = FALSE
+)
+
+df <- all_data[training_index, ]
+df_test <- all_data[-training_index, ]
+
+saveRDS(df, "output/supp_material/supp3_mixed_model/df_training.rds")
+saveRDS(df_test, "output/supp_material/supp3_mixed_model/df_testing.rds")
+```
+
+<br />
+
+This supplementary material addresses model building and validation for the prediction of bacteria absolute abundance in terms of sample Colony-forming Units (CFU). Similar to the microbial load model, we address the problem in the $log_{10}$ scale as it is commonly used in the realm of classical microbiology. We propose a (Bayesian) mixed-effects cumulative logit model for three main reasons:
+
+- Model the "partially discretized" outcome space as an ordinal variable using cumulative probabilities;
+- Accounting for taxon-to-taxon variation in the relationship between number of NGS-derived reads and CFU;
+- Take advantage of hierarchical structure and partial pooling.
+
+The first feature addresses peculiarities of the present modeling task which will be further explained below. The taxon-to-taxon variation is a known challenge in the microbiome literature, as different taxa are detected with different efficiencies by NGS technology [@McLaren2019; @Williamson2019]. Hierarchical structure and partial pooling will be important to allow abundance estimation for previously unseen taxa as well as generalization for out-of-sample data.
+
+For completeness and clarity, some of the material in this section reproduces the text in the Supplementary Material for the microbial load model (Supp. Mat. 2).
+
+## Why ordinal regression?
+
+Colony-forming units are continuous measures. However, in classical microbiology, the ability to quantify microbial abundance has limited resolution: values differ mainly in orders of magnitude, and it is difficult to state replicable differences within the same magnitude range. Hence, decision-making based on such data relies mostly on logarithmic differences, and values such as $2*10^3$ and $3*10^3$ are often treated as approximately equal. The effect of this "partial discretization" of the outcome space impacts the assumptions of most common regression techniques. Ordinary linear regression is not robust to outliers or high-leverage points, assuming the Gaussian response $Y|X_1$ is a simple shift from $Y|X_2$ [@Harrel2015]. Quantile regression is another option but it assumes the distribution of the outcome to be continuous. These challenges hamper modeling of CFU values and are illustrated with third-order polynomial fits in Figure 1.
+
+
+<br />
+
+```{r f1_standard_linear_regression, fig.cap=figure1_caption, fig.width=8}
+figure1_caption <- 'Figure 1. CFU as a function of observed NGS reads (plus pseudocount of 1 to avoid log of zero). Each bacteria is plotted in a different color. Black dashed line indicates overall ("grand mean") profile. The trend lines were captured with (third-order) polynomial ordinary least squares regression.'
+lin_reg_plot <- df %>%
+  ggplot(aes(reads + 1, cfu)) +
+  geom_jitter(aes(fill = bacteria),
+              width = 0, height = 0.05,
+              pch = 21, color = "gray40"
+  ) +
+  yscale("log10", .format = TRUE) +
+  xscale("log10", .format = TRUE) +
+  geom_smooth(aes(group = bacteria, color = bacteria),
+              method = "lm",
+              formula = y ~ poly(x, 2), se = FALSE,
+              show.legend = FALSE
+  ) +
+  geom_smooth(aes(group = 1),
+              color = "black", linetype = "longdash",
+              method = "lm", formula = y ~ poly(x, 2), se = FALSE,
+              show.legend = FALSE
+  ) +
+  labs(
+    x = "# reads", y = "CFU",
+    fill = NULL, color = NULL
+  ) +
+  theme(
+    legend.text = element_text(
+      size = 11,
+      face = c(
+        rep("italic", 4), "bold", rep("italic", 2)
+      )
+    ),
+    legend.position = "bottom",
+    axis.title = element_text(face = "bold", color = "gray20")
+  )
+
+lin_reg_plot_inv <- df %>%
+    ggplot(aes(cfu, reads + 1)) +
+    geom_jitter(aes(fill = bacteria),
+                width = 0.05, height = 0,
+                pch = 21, color = "gray40"
+    ) +
+    yscale("log10", .format = TRUE) +
+    xscale("log10", .format = TRUE) +
+    geom_smooth(aes(group = bacteria, color = bacteria),
+                method = "lm",
+                formula = y ~ poly(x, 2), se = FALSE,
+                show.legend = FALSE
+    ) +
+    geom_smooth(aes(group = 1),
+                color = "black", linetype = "longdash",
+                method = "lm", formula = y ~ poly(x, 2), se = FALSE,
+                show.legend = FALSE
+    ) +
+    labs(
+        y = "# reads", x = "CFU",
+        fill = NULL, color = NULL
+    ) +
+    theme(
+        legend.text = element_text(
+            size = 11,
+            face = c(
+                rep("italic", 4), "bold", rep("italic", 2)
+            )
+        ),
+        legend.position = "bottom",
+        axis.title = element_text(face = "bold", color = "gray20")
+    )
+
+check_dir("output/main_text_figures/fig2/")
+saveRDS(lin_reg_plot_inv, "output/main_text_figures/fig2/fig2d.rds")
+saveRDS(lin_reg_plot, "output/main_text_figures/fig2/fig2f.rds")
+
+lin_reg_plot
+```
+
+
+Notice how the linear models hardly fit the data. In many cases, the bacteria-specific fits are highly impacted by outliers, especially samples in which the taxon failed to be detected - common situation for low abundances, shown in the plot as $x = 10^0=1$ given the addition of pseudocount of 1. Importantly, the predictions are not bounded in any way: higher values of observed reads lead to higher abundances, which is certainly unrealistic given inevitable PCR saturation during laboratory protocol. While the data seems to follow a stepwise fashion (varies mainly across orders of magnitude), the OLS estimator fails to capture such structure. Given this scenario, ordinal models present interesting characteristics:
+
+- __Robust estimation__: we are directly modeling (a function of) the cumulative distribution function (CDF, $Pr(Y \le y)$) in a semi-parametric manner [@Liu2017];
+- __Bounded predictions__: as we treat the data as discrete using a multinomial/categorical likelihood for each unique $y_i$ observed, the outcome space is fully determined and all estimations lie within the range of observable data;
+- __Ordered modeling of continuous latent variable__: while abundance in CFU is in principle continuous, in practice the observed values differ mainly in orders of magnitude, motivating the derivation of Proportional Odds models [@Agresti2015].
+- __Wealth of output information__: from the estimated CDF we can derive conditional values of class probabilities, expectations, quantiles, tail probabilities, etc.
+
+## Hierarchical Cumulative Probability Model predicts Microbial CFU
+
+Here we describe the _cumulative probability model_ (CPM), also called _proportional odds_ (PO) model. Formal introductions to ordinal regression are provided in [@Burkner2019; @Liu2017a; @Harrel2015; @McElreath2015]. Alternatives to CPM include sequential models and adjacent category models, which we avoid to rely on the interpretability of CPM. Briefly, the model setting is similar to the one in standard (multinomial) logistic regression with $K$ possible outcomes (classes), except that now the log-odds are based on cumulative probabilities. For each class $c_k \text{ for }k \in \{1, 2, ..., K-1\}$:
+
+$$
+\log{\frac{{\Pr(Y \leq c_k)}}{1-\Pr(Y \leq c_k)}} = \alpha_k - \psi
+$$
+
+$$
+\psi = \beta_1 X_1 + \beta_2 X_2 + \dots + \beta_m X_m
+$$
+
+The term $\alpha_k$ is the cutpoint associated with the class $c_k$, and the subtracted linear model is left without a standard intercept for identifiability (no $\beta_0$). The subtraction ensures positive coefficients are associated with higher outcome values. When dealing with $K$ total classes, we model explicitly only $K-1$ because the last one is completely determined given a sum-to-one constraint, _i.e._, $\Pr(Y \leq c_K) = 1$. Note that as we are using only library size as predictor, here $\psi = \beta_1 X_1$. Once the model is fitted, one can recover class probabilities as well as expected values conditional on data:
+
+$$
+\Pr(Y = c_k\ |\ X=x)  = \Pr(Y \leq c_k\ |\ X=x) - \Pr(Y \leq c_{k - 1}\ |\ X=x) \\
+\mathop{\mathbb{E}}[Y|X=x] = \sum_{k=1}^{K}{c_k\ Pr(Y = c_k\ |\ X=x)}
+$$
+
+Calculating conditional expectations may not make sense in many cases (_e.g._ when the response has no continuous interpretation such as $Y \in \{small,\ medium,\ large\}$). Here, on the other hand, expected values may be as interpretable as the classes themselves: when modeling classes of CFU values, we may predict relatively high probabilities to $Y = 1*10^1$ and $Y = 1*10^2$, for example. In such a case, their weighted average has a clear biological meaning: the expected CFU value is likely to lie between $1*10^1$ and $1*10^2$. While minimizing the probability of error, the class of highest probability (CHP, the most likely outcome) may suffer in terms of performance measures such as mean squared errors.
+
+### Checking Ordinality Assumption
+
+The main assumption behind the PO model is that the outcome behaves in ordinal fashion with respect to predictors [@Harrel2015]. Although Figure 1 suggests monotonicity in the relationship between number of reads and CFU abundance values, it is useful to plot stratified averages of the covariate according to levels of the outcome and compare the observations with the model-implied values. We use the function `plot.xmean.ordinaly` from the `rms` package to construct Figure 2.
+
+
+```{r f2_ordinality_assumption, fig.cap=figure2_caption}
+figure2_caption <- "Figure 2. Checking ordinality assumption."
+
+rafalib::mypar(3,3)
+walk(c(taxa_of_interest, "Overall Profile"), function(i) {
+  
+  plot.xmean.ordinaly(
+    
+    `CFU` ~ `log10( # reads + 1 )`,
+    
+    data = df %>%
+      filter(bacteria == i | i == "Overall Profile") %>%
+      mutate(
+        # just to make better-looking axes labels :)
+        `CFU` := droplevels(cfu_ranges),
+        `log10( # reads + 1 )` := log10(reads+1)
+      ),
+    
+    pch = 19, main = i
+    
+  )
+})
+
+```
+
+For each bacteria (and overall profile), connected solid dots represent the average NGS reads ($log_{10} (\text{# reads + 1})$) stratified by each CFU abundance level. Assuming that PO holds, the dashed line is the estimated expected value of reads given each value of abundance (_i.e._, estimated $\mathop{\mathbb{E}}[\ X\ |\ Y=y]$). As the sample means virtually follow the model-implied expectations, the plots suggest no major departures from ordinality assumptions in most cases, although abundance values $2*10^4$ and $2*10^5$ might be difficult to distinguish especially for _S. aureus_.
+
+### Model Specification
+
+We define the cumulative logit random effects model to predict bacteria-specific abundances based on observed NGS reads. Let $Y_{ij}$ denote the absolute abundance (in Colony-forming units) for the observation $i$, taxon $j$. Given our serially-diluted samples, we only observe $K=4$ abundance values such that $Y_{ij}$ takes values $c \in \{c_1, c_2, c_3, c_4\} = \{ 2\times10^2,\ 2\times10^3,\ 2\times10^4,\ 2\times 10^5 \}$. We then define the model:
+
+$$
+Y_{ij} \thicksim \text{Categorical}( \boldsymbol{ p_{ij} } ) \quad \boldsymbol{ p_{ij} } = (p_{ij1}, p_{ij2}, p_{ij3}, p_{ij4})^T \\ 
+p_{ijk} = \text{Pr}(\ Y_{ij} = c_k \ ) = \text{Pr}(\ Y_{ij} \leq\ c_k \ ) - \text{Pr}(\ Y_{ij} \leq\ c_{k - 1} \ ) \quad \text{for} \quad 1 < k < 4 \\
+p_{ij1} = \text{Pr}(\ Y_{ij} \leq\ c_1 \ ) \\ 
+p_{ij4} = 1 - \text{Pr}(\ Y_{ij} \leq\ c_3 \ ) \\
+logit[\ \text{Pr}(\ Y_{ij} \leq\  c_k \ )\ ] = \phi_{ijk} \quad , \quad \text{for } k = 1, 2 ,3 \\
+\phi_{ijk} = \alpha_{kj} - \beta_j \cdot x_{ij}
+$$
+
+where $x_{ij}$ is the number of reads observed in observation $i$ from bacteria $j$. Differently from the total microbial load model, here we have only four classes ($K=4$) and hence three cutpoints $\alpha_{k\cdot}$. More importantly, we allow both intercepts and slopes to vary across bacteria $j$, i.e.:
+
+$$
+\begin{bmatrix}
+\alpha_{kj} \\
+\beta_j
+\end{bmatrix} \thicksim \mathcal{N_2} \left ( \begin{bmatrix}
+\alpha_{k} \\
+\beta
+\end{bmatrix}, \Sigma \right )
+$$
+
+Notice the mean of this two-dimensional normal distribution is the vector of population-level parameters $(\alpha_{k} \ \ \beta)^T$. The variance-covariance matrix $\Sigma$ governs how the group-level parameters vary around the population means:
+
+$$
+\Sigma = \begin{bmatrix}
+\sigma_{\alpha_{k}} \quad 0 \\
+0 \quad \sigma_{\beta}
+\end{bmatrix} \cdot \boldsymbol{R} \cdot \begin{bmatrix}
+\sigma_{\alpha_{k}} \quad 0 \\
+0 \quad \sigma_{\beta}
+\end{bmatrix} = \begin{bmatrix}
+\sigma_{\alpha_{k}}^2 \quad \sigma_{\alpha_{k}\ \beta} \\
+\sigma_{\alpha_{k} \ \beta} \quad \sigma_{\beta}^2
+\end{bmatrix} \quad , \quad \boldsymbol{R} = \begin{bmatrix}
+1 \quad \rho \\
+\rho \quad 1
+\end{bmatrix}
+$$
+
+where $\sigma_{\alpha_{k}}^2$ is the variance of $\alpha_k$, $\sigma_{\beta}^2$ is the variance of $\beta$, and $\sigma_{\alpha_{k}\ \beta}$ and $\rho$ are their covariance and correlation, respectively. We set the prior distributions for each unknown parameter:
+
+$$
+\alpha_k \thicksim \mathcal{N}(0, 2.5) \quad \beta \thicksim \mathcal{N}(0, 2.5) \\
+\sigma_{\alpha_{k}} \thicksim \mathcal{Exp}(1) \quad \sigma_{\beta} \thicksim \mathcal{Exp}(1) \\
+\boldsymbol{R} \thicksim \text{LKJcorr}(2) 
+$$
+
+The LKJ prior on the correlation matrix $\boldsymbol{R}$ drives skepticism regarding extreme correlation values near $-1$ and $1$ (McElreath, 2015a). Jointly, the behavior of the prior distributions favors outers categories ($c_k \in \{c_1,c_4\}$) in order to improve distinguishability for cases in which there are overlapping average number of reads.
+
+### Prior Predictive Check
+
+Our apparently weakly-informative priors actually have an informative joint behavior. We put more weight on outer $c_k$'s in order to improve distinguishability in challenging cases, such as _S. aureus_ (see Figure 2). We first fit the model ignoring the likelihood and illustrate such behavior with prior-predictive checks. We then observe the posterior effects of this model in the following section. 
+
+```{r prior_pred_check}
+inits_mags = list(
+  `Intercept[1]` = -1, `Intercept[2]` = 0.2,
+  `Intercept[3]` = 1, `reads` = 0
+)
+
+
+inits_mags_list = list(inits_mags, inits_mags, inits_mags, inits_mags)
+
+prior_ma <- prior(normal(0, 2.5), class = "b") +
+  prior(normal(0, 2.5), class = "Intercept") +
+  prior(exponential(1), class = "sd") +
+  prior(lkj(2), class = "cor")
+
+if (isTRUE(REFIT)) {
+  fit_prior <- brm(
+    cfu_ranges ~ log10_reads + (1 + log10_reads | bacteria) ,
+    data = df %>% mutate(bacteria = factor(bacteria)),
+    prior = prior_ma,
+    chains = 4, 
+    cores = 4,
+    iter = 3000,
+    inits = inits_mags_list, 
+    family = cumulative(link = 'logit', threshold = 'flexible'),
+    seed = SEED,
+    # avoid divergent transitions
+    control = list(adapt_delta = 0.85, max_treedepth = 15),
+    sample_prior = "only",
+    refresh = 0
+  )
+  saveRDS(fit_prior, "output/supp_material/supp3_mixed_model/fit_prior.rds")
+} else {
+  fit_prior <- readRDS("output/supp_material/supp3_mixed_model/fit_prior.rds")
+}
+
+fit_prior
+```
+
+<br /><br />
+
+The model fit, ignoring the likelihood (data), demonstrates the monotonicity of the cutpoints (here as `Intercept[k]`). Figure 3 shows the actual densities for the parameters (Figure 3A) as well as the prior predictive distribution behavior (Figure 3B).
+
+
+<br />
+
+```{r f3_prior_pred_check, fig.width=12, fig.height=8, fig.cap=figure3_caption}
+figure3_caption = "Figure 3. Prior-predictive check."
+
+df_prior_check <- tidy_draws(fit_prior) %>%
+  pivot_longer(
+    cols = c(contains("b_Intercept"), "b_log10_reads", contains("r_bacteria"))
+  ) %>%
+  mutate(
+    parameter_type = ifelse(startsWith(name, "r_"),
+                            "Random Effects",
+                            ifelse(startsWith(name, "b_Intercept"),
+                                   "Cutpoints",
+                                   ifelse(startsWith(name, "b_log10"), 
+                                          "Fixed Effect (slope)",
+                                          "Correlation"))
+    )
+  )
+
+p1_prior_check <- df_prior_check %>%
+  ggplot(aes(value, fill = parameter_type )) +
+  geom_density(aes(group = name), show.legend = FALSE) +
+  scale_fill_discrete() +
+  labs(fill = "Parameters") +
+  theme(legend.position = 'right',
+        strip.text = element_text(face = "bold", color = "gray20", size = 14)) +
+  facet_wrap(~parameter_type, nrow = 4, scales = 'free')
+
+
+prior_check_bars <- pp_check(fit_prior, type = "bars", nsamples = 200) +
+  labs(x = "k")
+
+( p1_prior_check | prior_check_bars) +
+  plot_annotation(title = "Prior Predictive Check", tag_levels = "A") +
+  plot_layout(widths = c(.275, .725))
+
+```
+
+Notice the priors on the cutpoints (Figure 3B). Although apparently weakly informative ($\mathcal{N}(0, 2.5)$), when applied to the proportional odds model they yield higher (and more variable) probabilities at the outer abundance values ($Y_{ij} \in \{c_1, c_4\}$). While in most cases this information hardly impacts the effect of the likelihood, it will be beneficial to counterbalance cases in which the differentiation between adjacent classes is challenging (_e.g._ higher values for _S. aureus_ - see Figure 2). We further explore the consequences of the prior choices in the next section. 
+
+### Posterior Predictive Check
+
+Next, we fit the full model (_i.e._ include the likelihood). The overall location of the cutpoints is positive (in logit scale) with relatively small uncertainty. The effect of NGS reads also behaves similarly. Notice intercept and slope are negatively correlated, and the variation in intercepts is considerably higher than that of the slope. The model showed no apparent lack of convergence.
+
+<br />
+
+```{r fit_first_model}
+if (isTRUE(REFIT)) {
+  fit <- update(fit_prior, sample_prior = "no", seed = SEED,
+                cores = 4, chains = 4,
+                control = list(adapt_delta = 0.95),
+                refresh = 0
+  )
+  saveRDS(fit, "output/supp_material/supp3_mixed_model/fit.rds")
+} else {
+  fit <- readRDS("output/supp_material/supp3_mixed_model/fit.rds")
+}
+
+fit
+```
+
+
+< br/>
+
+Figure 4 shows the posterior distribution of fitted parameters (Figures 4A and 4C) as well as posterior predictive check (Figure 4B).  
+
+<br />
+
+
+```{r f4_posterior_pred_check, fig.width=16, fig.height=14, fig.cap=figure4_caption}
+
+figure4_caption = "Figure 4. (A) posterior distribution of fixed and random effects. (B) posterior predictive check. (C) posterior distribution of random effects for each bacteria individually. Points show posterior medians, plotted along with 95% and 66% credible intervals."
+
+df_posterior_check <- tidy_draws(fit) %>%
+  pivot_longer(
+    cols = c(contains("b_Intercept"), "b_log10_reads", contains("r_bacteria"))
+  ) %>%
+  mutate(
+    parameter_type = ifelse(startsWith(name, "r_"),
+                            "Random Effects",
+                            ifelse(startsWith(name, "b_Intercept"),
+                                   "Cutpoints",
+                                   ifelse(startsWith(name, "b_log10"), 
+                                          "Fixed Effect (slope)",
+                                          "Correlation"))
+    )
+  )
+p1_posterior_check <- df_posterior_check %>%
+  ggplot(aes(value, fill = parameter_type )) +
+  geom_density(aes(group = name), show.legend = FALSE) +
+  scale_fill_discrete() +
+  labs(fill = "Parameters") +
+  theme(legend.position = 'right',
+        strip.text = element_text(face = 'bold', color = 'gray20', size = 14)) +
+  facet_wrap(~parameter_type, nrow = 4, scales = 'free')
+
+effects_plot <- df_posterior_check %>%
+  mutate(
+    bacteria = ifelse(startsWith(name, "r_bact"),
+                      str_extract(name,
+                                  "\\w+\\.\\w+"),
+                      name)
+  ) %>%
+  ggplot(aes(value, fill = bacteria )) +
+  geom_density(aes(group = name),
+               show.legend = T, alpha = .9) +
+  scale_fill_manual(values = c(
+    brewer.pal(4, "Set2"),
+    brewer.pal(3, "Dark2")[1],
+    brewer.pal(5, "Set2")[5],
+    brewer.pal(7, "Dark2")[-1]
+  )) +
+  labs(fill = "Parameters") +
+  theme(legend.position = 'right',
+        strip.text = element_text(face = 'bold',
+                                  color = 'gray20',
+                                  size = 14)) +
+  facet_wrap(~parameter_type + bacteria, nrow = 4, scales = 'free')
+
+random_effects_by_bacteria <- df_posterior_check %>%
+    filter(parameter_type == "Random Effects") %>%
+    mutate(.type = str_extract(name, "Intercept|log10_reads"),
+           .type = ifelse(.type == "log10_reads", "Slope", "Cutpoints"),
+           bac_name = str_extract(name, "[A-Z]\\w+\\.\\w+"),
+           bac_name = str_replace(bac_name, "\\.", " "),
+           .value = value) %>%
+    ggplot(aes(x = .value, y = reorder(bac_name, -.value), fill = bac_name)) +
+    facet_wrap(~ .type, scales = "free_x") +
+    scale_x_continuous(breaks = scales::pretty_breaks()) +
+    geom_vline(xintercept = 0, linetype = "longdash",
+               color = "gray40", alpha = .5, size = 1.2) +
+    scale_fill_brewer(palette = "Set2") +
+    stat_halfeyeh() +
+    theme(axis.text.y = element_text(face = "bold.italic", color = "gray20"),
+          axis.title.x = element_text(face = "bold",color = "gray20", size = 14),
+          strip.text = element_text(face = "bold",color = "gray20", size = 14)) +
+    guides(fill = 'none') +
+    labs(y = NULL, x = "Random Effects")
+
+posterior_check_bars <- pp_check(fit, type = "bars", nsamples = 250) +
+  labs(x = "k")
+
+
+
+ggarrange(
+  ggarrange(p1_posterior_check, posterior_check_bars,
+            widths = c(.275, .725), labels = LETTERS[1:2]),
+  ggarrange(random_effects_by_bacteria + geom_hline(yintercept = 1:6,
+               linetype ="longdash",
+               alpha = .1), labels = "C"),
+  heights = c(.4, .6),
+  nrow = 2
+)
+```
+
+<br /><br />
+
+Overall, the data generating process implied by the model captures the observed data nicely, at least at the population level (Figure 4B). Notice the random effects vary significantly. Under this model, _B. cereus_ and _S. epidermidis_ seem to be the taxa that most deviate from the overall profile. This is because the posteror distribution of their random effects parameters show the largest absolute values (Figure 4C). Further, we can also perform posterior predictive check in a bacteria-specific fashion, which is shown in Figure 5.
+
+
+```{r f5_post_pred_check_grouped, fig.width=12, fig.height=8, fig.cap=figure5_caption}
+figure5_caption = "Figure 5. Posterior-predictive check at the bacteria level."
+posterior_check_bars_grouped <- pp_check(fit, type = "bars_grouped",
+                                         group = "bacteria", nsamples = 250) +
+  theme(
+    axis.title = element_text(face = "bold", color = 'gray20', size = 14),
+    strip.text = element_text(face = 'bold', color = 'gray20', size = 14)
+  ) +
+  labs(x = "k")
+posterior_check_bars_grouped
+```
+
+Adaptive shrinkage, characteristic of this type of model, expectedly reduces fit to sample. Yet, the hierarchical model still captures the overall data structure, with variations in some bacteria. Notice the ones that show relatively worse fit are the same that showed paralelism in Figure 2. Especially, $S. aureus$ had shown the least compatible profile, and here yielded the worse posterior fit to the sample - even though the chosen priors mitigate such issue. As there seems to be significant taxon-to-taxon variation, the low number of bacteria available may lead to substantial uncertainty in the estimation of random effects. Nonetheless, while the hierarchical structure is expected to show worse in-sample fit, it improves predictive performance out of sample [@McElreath2015]. 
+
+### CFU Predictions 
+
+Given the cumulative probability model structure, we can now recover the CFU predictions based on class probabilities as well as conditional expectations. 
+
+#### Class probabilities
+
+Figure 6 shows the model-implied class probabilities conditional on the number of reads for each observed bacteria.
+
+<br />
+
+```{r f6_class_probs, fig.width=16, fig.height=8, fig.cap=figure6_caption}
+
+figure6_caption <- "Figure 6. Posterior CFU probabilities as a function of number of NGS reads. Rug plots below each curve show the observed data points."
+
+bacs <- unique(df$bacteria)
+names(bacs) <- bacs
+
+fitted_data <- map(bacs, function(bac) {
+  data.frame() %>%
+    data_grid(
+      log10_reads = seq_range(c(0, 5), n = 200),
+      bacteria = bac
+    ) %>%
+    add_fitted_draws(fit, n = 100, seed = SEED,
+                     allow_new_levels = TRUE) %>%
+    ungroup %>%
+    mutate(
+      .category = class_dict[as.numeric(.category)]
+    ) %>%
+    group_by(log10_reads, bacteria, .row, .category)
+})
+
+get_pred_int_data <- function(bac, fit, newdata = NULL) {
+  if (is_null(newdata)) {
+    d <- data.frame(log10_reads = seq_range(c(0, 5), n = 300),
+                    bacteria = bac, seed = SEED)
+  } else {
+    d <- newdata
+  }
+  data.frame(
+    predictive_interval(fit, newdata = d, prob = 0.95,
+                        allow_new_levels = TRUE,
+                        seed = SEED),
+    d
+  ) %>%
+    mutate(.lower = class_dict[as.numeric(as.character(X2.5.))],
+           .upper = class_dict[as.numeric(as.character(X97.5.))],
+           .lower = as.numeric(.lower),
+           .upper = as.numeric(.upper)) 
+  
+}
+
+pred_interval_data <- map(bacs, get_pred_int_data,
+                          fit = fit)
+
+get_expecs_data <- function(fitted_data) {
+  fitted_data %>%
+    mutate(
+      magnitude = as.numeric(as.character(.category)),
+    ) %>%
+    group_by(.row, log10_reads, bacteria, .draw) %>%
+    summarise(
+      expectation = sum(magnitude * .value)
+    ) 
+}
+expectations_data <- map(fitted_data, get_expecs_data) 
+
+plot_cond_probs <- function(fitted_data, bac, df) {
+  fitted_data %>%
+    median_qi() %>%
+    ggplot(aes(log10_reads, .value,
+               color = .category, fill = .category)) +
+    geom_line() +
+    geom_ribbon(aes(ymin = .lower, 
+                    ymax = .upper, color = NULL),
+                alpha = .3,
+                show.legend = FALSE) +
+    facet_wrap(~bacteria, scales = 'free') +
+    geom_rug(data = df %>% filter(bacteria == bac), 
+             aes(x = log10_reads, color = cfu_ranges),
+             show.legend = FALSE, inherit.aes = FALSE) +
+    theme(axis.title.y = element_text(face = "bold", color = 'gray20', size = 10),
+          strip.text = element_text(face = 'bold', color = 'gray20', size = 14),
+          legend.position = "top",
+          legend.justification = c(0, 0)
+    ) +
+    labs(y = "Probability", x = TeX("$log_{10}(#reads)$"),
+         fill = "CFU", color = "CFU")
+}
+conditional_probabilities <- imap(fitted_data, plot_cond_probs, df = df)
+
+post_probs_plot <- ggarrange(plotlist = conditional_probabilities,
+                             nrow = 2, ncol = 3)
+
+
+post_probs_plot
+```
+
+<br /><br />
+
+Notice the profiles differ substantially. Nonetheless, the class probabilities respect the monotonic fashion of the data, _i.e._, the decrease in probability for a class $c_k$ is accompanied by the increase for class $c_{k+1}$. The rug plots help visualizing the cases in which the model may face difficulty in terms of classification.
+
+#### Expected values and class of highest probability
+
+Next, we compute expected CFU abundances as $\mathbb{E}[Y\ |\ X=x] = \sum_{k=1}^{K}{c_k*Pr(Y=c_k\ |\ X=x)}$ and compare them with the class of highest probability (CHP, most likely outcome for each value $x$). The model-implied CFU predictions are plotted in Figure 7. Black lines show conditional expectations, while red lines indicate the class of highest probability. Respective 95% credible Intervals (CI) are shown in blue and gray.
+
+<br />
+
+```{r f7_expectations, fig.width=16, fig.height=9, fig.cap=figure7_caption}
+
+figure7_caption <- "Figure 7. Predictions for Colony-forming units based on NGS reads. Black lines show expected values, while red lines indicate the CHP. Blue bands show the 95% credible interval for the expectations, while gray bands show the 95% predictive interval for the estimated abundance values."
+
+plot_cond_expecs <- function(bac, expectations_data, pred_interval_data,
+                             fitted_data, df, points_fill_color = NULL) {
+  interval_data <- pred_interval_data[[bac]]
+  magnitudes_of_highest_probs <- fitted_data[[bac]] %>%
+    median_qi() %>%
+    group_by(log10_reads) %>%
+    top_n(1, wt = .value) %>%
+    mutate(.cat = as.numeric(as.character(.category)))
+  set.seed(SEED)
+  expectations_data[[bac]] %>%
+    median_qi() %>%
+    ggplot(aes(x = log10_reads)) +
+    geom_ribbon(aes(ymin = .lower, ymax = .upper),
+                fill = "#0089FF", alpha = 1/2) +
+    geom_jitter(data = df %>% filter(bacteria == bac), 
+                aes(x = log10_reads, 
+                    y = as.numeric(as.character(cfu_ranges))),
+                inherit.aes = F,
+                width = 0, height = .05, pch = 21,
+                color = 'gray20', 
+                fill = ifelse(is.null(points_fill_color), 'gray70', points_fill_color)
+    ) +
+    geom_ribbon(data = interval_data, 
+                aes(ymin = .lower, ymax = .upper, x = log10_reads),
+                alpha = 1/4, fill = "gray20") +
+    geom_line(aes(y = expectation), size = 1.2) +
+    geom_line(data = magnitudes_of_highest_probs,
+              aes(y= .cat), color = "red") +
+    geom_hline(yintercept = 2*10^(2:5),
+               alpha = .2, size = .3,
+               linetype = "dashed") +
+    facet_wrap(~ bacteria, scales = "free") +
+    labs(
+      y = "Absolute Abundance (CFU)", x = TeX("$log_{10}(#reads)$")
+    ) +
+    theme(
+      legend.position = 'right',
+      axis.title = element_text(face = "bold", color = 'gray20', size = 10),
+      strip.text = element_text(face = 'bold', color = 'gray20', size = 16)
+    ) +
+    yscale('log10', TRUE)
+}
+
+conditional_expectations <- map(bacs, plot_cond_expecs,
+                                expectations_data = expectations_data,
+                                pred_interval_data = pred_interval_data,
+                                fitted_data = fitted_data,
+                                df = df)
+
+cond_exp_plot <- ggarrange(plotlist = conditional_expectations,
+                           nrow = 2, ncol = 3)
+cond_exp_plot
+```
+
+<br /><br />
+
+The estimated expectations are smooth functions, while still respecting the monotonic, stepwise fashion of the data. The classes of highest probabilities, in turn, are step functions. Importantly, both are bounded within the outcome space: no predictions fall outside the range of observed data. We replicate parts of Figure 6 and 7 for three bacteria below to stress their relationship with the actual estimated probabilities (Figure 8).
+
+<br />
+
+```{r f8_probs_and_expecs, fig.width=16, fig.height=8, fig.cap=figure8_caption}
+
+figure8_caption <- "Figure 8. Relationship between estimated probabilities (top) and implied CFU predictions (bottom). Pseudocount of 1 was added to reads values to avoid log of zero."
+
+plot_probs_and_expects <- function(bac, cond_probs, cond_expecs) {
+  p1 <- conditional_probabilities[[bac]]
+  p2 <-  conditional_expectations[[bac]]
+  
+  if (bac != bacs[3]) {
+    p1 <- p1 +
+      theme(axis.title.y = element_blank()) +
+      guides(fill = 'none', color = 'none')
+    p2 <-  p2 +
+      theme(axis.title.y = element_blank()) +
+      guides(fill = 'none', color = 'none')  
+  }
+  .plot <- ( p1 + theme(axis.text.x = element_blank(),
+                        axis.title.x = element_blank(),
+                        axis.ticks.x = element_blank()) ) / p2
+  
+  return(.plot)
+} 
+
+probs_and_expecs <- map(bacs, plot_probs_and_expects,
+                        cond_probs = conditional_probabilities,
+                        cond_expecs = conditional_expectations)
+mixed_plot <- (
+  probs_and_expecs$`Salmonella enterica` | 
+    probs_and_expecs$`Bacillus cereus` | 
+    probs_and_expecs$`Listeria monocytogenes`
+)
+mixed_plot
+```
+
+<br /><br />
+
+Notice the strict relationship between the CHP (red lines, lower panels) and the intersections between the class probabilities in the upper panels. Also, the estimated expectations (black lines) vary monotonically as we move away from the probability intersections but remain within the 95% predictive intervals of the abundance values (gray bands).
+
+
+<br /><br />
+
+### Model Validation
+
+```{r}
+K = 10
+```
+
+We further validate the model using cross-validation and test-set validation with held-out data. First, we perform `r K`-fold cross-validation to estimate overall predictive performance of the model. We then use leave-one-group-out cross-validation to investigate whether the model yields reasonable predictions for previously unseen bacteria.
+
+#### `r K`-fold cross-validation
+
+We perform `r K`-fold cross validation and assess the predictive performance. Figure 9 shows the results. For visualization, we have split the assessed metrics into bounded between 0 and 1 and unbounded metrics. Bounded metrics based on CHP included the observed coverage of 95% predictive interval (gray bands in Figure 7), Somers’ Delta (a measure of ordinal association), classification accuracy, and Spearman’s rank correlation. The latter was also assessed for expectation-based predictions. In general, these metrics had medians varying above 0.9, except for _S. aureus_ and _S. epidermidis_. Notably, the predictive intervals showed 100% coverage for almost all bacteria, which is likely overconfident. We also observe median Somers' Delta varying between (slightly below) 0.85 and 0.98.
+
+```{r cv_functions}
+# define cv functions
+cv_fit <- function(partition_index, compiled_fit) {
+  library(Rcpp)
+  .columns <- c("cfu_ranges", "log10_reads", "cfu", "bacteria", "sample")
+  # partition data
+  validation_training <- df[-partition_index, .columns]
+  validation_testing <- df[partition_index, .columns]
+  # fit sub-model
+  
+  fold_fit <- update(
+    compiled_fit, 
+    newdata = validation_training %>% mutate(bacteria = factor(bacteria)),
+    chains = 2, cores = 2, iter = 2000, seed = SEED, # refresh = 0,
+    control = list(adapt_delta = 0.95, max_treedepth = 15)
+  )
+  
+  # compose output with everything you've done
+  output <- list(
+    data = list(train = validation_training, test = validation_testing),
+    fit = fold_fit
+  )
+  return(output)
+}
+get_predictions <- function(bac, .fit, .test_data) {
+  d <- .test_data %>% 
+    filter(bacteria == bac)
+  .pred_ints <- get_pred_int_data(bac = bac, fit = .fit, newdata = d)
+  .fitted_data <- data.frame(
+    d, 
+    .lower_bound = .pred_ints$.lower,
+    .upper_bound = .pred_ints$.upper
+  ) %>%
+    add_fitted_draws(.fit, n = 200,
+                     seed = SEED,
+                     allow_new_levels = TRUE) %>%
+    ungroup %>%
+    mutate(
+      .category = factor(.category, levels = 1:4,
+                         labels = levels(cfu_ranges), ordered = TRUE)
+    ) %>%
+    group_by(cfu_ranges, log10_reads, cfu, bacteria, sample, 
+             .lower_bound, .upper_bound, .row, .category)
+  
+  class_of_highest_prob <- .fitted_data %>%
+    median_qi() %>%
+    group_by(sample) %>%
+    top_n(1, wt = .value) %>%
+    mutate(chp = as.numeric(as.character(.category))) %>%
+    select(sample, bacteria, cfu_ranges, cfu, log10_reads,
+           chp, .lower_bound, .upper_bound)
+  
+  expecs <- .fitted_data %>%
+    mutate(
+      magnitude = as.numeric(as.character(.category))
+    ) %>%
+    group_by(sample, .row, log10_reads, .draw) %>%
+    summarise(expecs = sum(magnitude * .value)) %>%
+    median_qi()
+  
+  .predictions <- left_join(class_of_highest_prob, expecs, by = "sample")
+  return(.predictions)
+} 
+get_performance <- function(.predictions, .test_data) {
+  .output <- .predictions %>%
+    ungroup() %>%
+    mutate(
+      true_value = round(as.numeric(as.character( cfu_ranges ))),
+      chp = round(as.numeric(as.character( chp )))
+    ) %>%
+    summarise(
+      expec_malr = mean( abs(log10(expecs) - log10(true_value)) ),
+      expec_mae_r = mean( abs(expecs - true_value) / true_value ),
+      chp_malr = mean( abs(log10(chp) - log10(true_value)) ),
+      chp_mae_r = mean( abs(chp - true_value) / true_value ),
+      chp_overall_accuracy = mean(chp == true_value),
+      .coverage = mean(true_value >= .lower_bound & true_value <= .upper_bound),
+      chp_spearman = cor(chp, true_value, method = "spearman"),
+      expec_spearman = cor(expecs, true_value, method = "spearman"),
+      chp_somers = DescTools::SomersDelta(chp, true_value)
+    )
+  return(.output)
+}
+cv_assess <- function(fold_fit, bacs) {
+  names(bacs) <- bacs
+  .partitions_colors <- c("training" = "gray40", "testing" = "blue")
+  .fit <- fold_fit$result$fit
+  .test_data <- fold_fit$result$data$test
+  
+  .plotting_data <- bind_rows(
+    data.frame() %>%
+      data_grid(log10_reads = seq_range(c(0, 5), n = 201),
+                bacteria = bacs, cfu = NA, cfu_ranges = NA),
+    .test_data %>% 
+      select(log10_reads, bacteria, cfu, cfu_ranges)
+  )
+  
+  .fitted_data <- map(bacs, function(bac) {
+    .plotting_data %>% filter(bacteria == bac) %>%
+      add_fitted_draws(.fit, allow_new_levels = TRUE, seed = SEED, n = 2) %>%
+      ungroup %>%
+      mutate(
+        .category = levels(cfu_ranges)[as.numeric(.category)]
+      ) %>%
+      group_by(log10_reads, bacteria, cfu, cfu_ranges, .row, .category)
+  })
+  
+  .expectations_data <- map(.fitted_data, get_expecs_data)
+  
+  .pred_interval_data <- map(bacs, get_pred_int_data, fit = .fit)
+  
+  .conditional_expectations <- map(bacs, plot_cond_expecs,
+                                   expectations_data = .expectations_data,
+                                   pred_interval_data = .pred_interval_data,
+                                   fitted_data = .fitted_data,
+                                   df = .test_data,
+                                   points_fill_color = "blue")
+  
+  .predictions <- map(bacs, get_predictions, 
+                      .fit = .fit, .test_data = .test_data)
+  .errors <- map(.predictions, get_performance)
+  .error_plots <- .errors %>% 
+    plyr::ldply(rbind, .id = "bacteria") %>% 
+    pivot_longer(cols = -bacteria) %>%
+    ggplot(aes(name, value)) +
+    geom_pointrange(aes(ymin = 0, ymax = value, color = bacteria),
+                    position = position_dodge(width = .5)) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 35, hjust = 1),
+          legend.position = "top") +
+    labs(x = NULL, color = NULL)
+  
+  output <- list(
+    .data = list(
+      .expecs_data = .expectations_data, 
+      .pred_int_data = .pred_interval_data 
+    ),
+    .plots = list(
+      .cond_expecs_plots = .conditional_expectations,
+      .error_plots = .error_plots
+    ),
+    .predictions = .predictions,
+    .errors = .errors
+  )
+  return(output)
+}
+join_plots <- function(performance_measures, .type = 'kfold') {
+  if (.type == "kfold") {
+    bacs <- names(performance_measures[[1]]$result$.predictions)
+    names(bacs) <- bacs
+    .errors <- ggarrange(
+      plotlist = imap(
+        performance_measures, ~.x$result$.plots$.error_plots + labs(title = .y)
+      ),
+      nrow = 4, ncol = 3, common.legend = T
+    )
+    .cond_expecs <- map(bacs, function(bac) {
+      ggarrange(
+        plotlist = imap(
+          performance_measures,  
+          ~.x$result$.plots$.cond_expecs_plots[[bac]] + labs(title = .y)),
+        nrow = 4, ncol = 3, common.legend = T
+      )
+    })
+  } else if(.type == "lgo") {
+    .errors <- ggarrange(
+      plotlist = imap(
+        performance_measures,
+        ~.x$result$.plots$.error_plots +
+          labs(title = .y) + guides(color = "none")
+      ),
+      nrow = 3, ncol = 3, common.legend = T
+    )  
+    .cond_expecs <- ggarrange(
+      plotlist = imap(
+        performance_measures, 
+        ~ .x$result$.plots$.cond_expecs_plots[[.y]] +
+          labs(title = .y) + guides(color = "none")
+      ),
+      nrow = 3, ncol = 3, common.legend = T
+    )
+    
+  } else {
+    stop("Can only handle type 'kfold' or 'lgo'.")
+  }
+  
+  .output = list(
+    .errors = .errors, .cond_expecs = .cond_expecs
+  )
+  return(.output)
+}
+join_errors <- function(performance_measures) {
+  .errors_df <- map(performance_measures, 
+                    ~ .x$result$.errors %>% plyr::ldply(rbind, .id = "bacteria")) %>%
+    plyr::ldply(rbind, .id = ".fold")
+  return(.errors_df)
+}
+join_cv_folds <- function(performance_measures, out_types = c("plots", "errors"),
+                          cv_type = "kfold") {
+  .results <- list()
+  for (.type in out_types) {
+    if (.type == "plots") {
+      .results[['.plots']] <- join_plots(performance_measures = performance_measures,
+                                         .type = cv_type)
+    } else if (.type == "errors") {
+      .results[['.errors']] <- join_errors(performance_measures = performance_measures)
+    } else {
+      stop("Only types 'plots' and 'errors' implemented this far :).")
+    }
+  }
+  return(.results)
+}
+```
+
+```{r kfold_run}
+
+if (isTRUE(REFIT)) {
+  set.seed(SEED)
+  folds <- caret::createFolds(df$cfu_ranges, k = K)
+  # Warning: pretty heavy computation, just so you know,
+  # took about 2 hours with 12 threads and 64gb RAM (although used ~7gb ram 'only')
+  # this might benefit from the 'jobs' tab in RStudio
+  future::plan(multiprocess, workers = future::availableCores() / 2 )
+  kf_cv_fits <- future_map(folds, safely(cv_fit),
+                           compiled_fit = fit,
+                           .progress = FALSE) # change this if curious like me
+  future::plan(sequential)
+  saveRDS(kf_cv_fits, str_glue("{output_dir}/kfold_cv_fits.rds"))
+} else {
+  kf_cv_fits <- readRDS(str_glue("{output_dir}/kfold_cv_fits.rds"))
+}
+
+if (isTRUE(REFIT)) {
+  # Warning 2: this also takes a while :)
+  # I made this "2-step thing" for running cv + assessing results
+  # because I wasn't sure my pc could handle processing both simultaneously
+  future::plan(multiprocess, workers = 10)
+  performance_measures <- future_map(kf_cv_fits, safely(cv_assess),
+                                     bacs = bacs,
+                                     .progress = FALSE)  # change this if curious like me
+  future::plan(sequential)
+  saveRDS(performance_measures,
+          str_glue("{output_dir}/kfold_cv_performance_measures.rds"))
+} else {
+  performance_measures <- readRDS(
+    str_glue("{output_dir}/kfold_cv_performance_measures.rds")
+  )
+}
+```
+
+```{r kfold_plot, fig.width=10, fig.height=8, fig.cap=figure9_caption}
+figure9_caption <- str_glue(
+  "Figure 9. {K}-fold cross-validation. 'CHP' denotes predictions based on the Class of Highest Probability. Predictions based on expectations are indicated likewise."
+)
+
+cv_results <- join_cv_folds(performance_measures = performance_measures)
+
+.labels <- list(
+  expec_malr = "MALR\n(expectation)",
+  expec_mae_r = "MAEr\n(expectation)",
+  expec_spearman = "Spearman\n(expectation)",
+  chp_malr = "MALR\n(CHP)",
+  chp_mae_r = "MAEr\n(CHP)",
+  chp_spearman = "Spearman\n(CHP)",
+  chp_overall_accuracy = "Accuracy\n(CHP)",
+  chp_somers = "Dxy\n(CHP)",
+  .coverage = "Coverage\n(CHP)"
+)
+unbounded_metrics <- c(
+  "expec_malr", "expec_mae_r",
+  "expec_mae_n", "chp_malr",
+  "chp_mae_r", "chp_mae_n"
+)
+kfold_plot <- cv_results$.errors %>%
+  pivot_longer(cols = -c(.fold, bacteria)) %>%
+  mutate(
+    .bounded = ifelse(
+      name %in% unbounded_metrics,
+      "Unbounded metrics", "Bounded metrics"
+    ),
+    name = factor(as.character(name),
+                  levels = names(.labels),
+                  labels = .labels)
+  ) %>%
+  ggplot(aes(name, value, fill = bacteria)) +
+  geom_boxplot(position = position_dodge(width = .75)) +
+  theme_bw() +
+  theme(axis.text.x = element_text(size = 14),
+        axis.text.y = element_text(size = 15),
+        legend.position = 'bottom',
+        legend.key.size = unit(.9, 'cm'),
+        legend.text = element_text(face = "bold", color = "gray40", size = 11),
+        strip.text = element_text(face = "bold", color = "gray20", size = 14)) +
+  labs(x = NULL,  y = NULL, fill = NULL) +
+  facet_wrap(~ .bounded, nrow = 2, scales = "free") +
+  scale_y_continuous(breaks = scales::pretty_breaks(5))
+
+kfold_plot
+```
+<br /><br />
+
+Unbounded metrics relied on modified versions of absolute errors, for both CHP- and expectation-based predictions. MALR denotes Mean Absolute Log-Ratio, a measure that captures how predictions miss observed values in terms of orders of magnitude on the $log_{10}$ scale.
+
+$$\text{MALR} = \frac{1}{n}\sum_{i=1}^{n}\mid log_{10}(\hat{y_i}) - log_{10}(y_i) \mid\ =\ \mid log_{10}(\frac{\hat{y_i}}{y_i}) \mid$$
+
+MALR varied consistenly below 0.5 for all bacteria. Perhaps more intuitive, we also computed the Mean Absolute Error relative to the true values, capable of measuring absolute errors as proportions of true values.
+
+$$\text{MAEr} = \frac{1}{n}\sum_{i=1}^{n}\frac{ \mid \hat{y_i} - y_i \mid }{y_i}$$
+
+Median MAEr values fell below 1 for all bacteria but _S. aureus_, and no MAEr value above 2.5 was observed.
+
+Notice that a MALR value of 1 corresponds to a ratio between predicted and observed values of one order of magnitude in the log10 scale. A MAEr of 1 indicates prediction absolute error as large as the true value, which would still be largely insignificant given the logarithmic scale. Overall, the model seems to generate accurate predictions for all observed bacteria, while _S. aureus_ represents the least performing case.
+
+#### Leave-one-group-out Cross-validation
+
+We now explore the predictive performance of our model on estimating previously unseen bacteria through leave-one-group-out cross-validation (LGO-CV). At each iteration, we hold out all the data from one bacteria, train the model with the remaining data, and then predict the held-out partition. The results are shown in Figure 10.
+
+```{r lgo_cv}
+if (isTRUE(REFIT)) {
+  lgo_folds <- map(bacs, ~ which(df$bacteria == .x))
+  # Warning: pretty heavy computation, just so you know,
+  # took about 2 hours with 12 threads and 64gb RAM (although used ~7gb ram 'only')
+  # this might benefit from the 'jobs' tab in RStudio
+  future::plan(multiprocess)
+  lgo_cv_fits <- future_map(lgo_folds, safely(cv_fit),
+                            compiled_fit = fit,
+                            .progress = TRUE) # change this if curious like me
+  future::plan(sequential)
+  saveRDS(lgo_cv_fits, str_glue("{output_dir}/lgo_cv_fits.rds"))
+} else {
+  lgo_cv_fits <- readRDS(str_glue("{output_dir}/lgo_cv_fits.rds"))
+}
+
+if (isTRUE(REFIT)) {
+  # Warning 2: this also takes a while :)
+  # I made this "2-step thing" for running cv + assessing results
+  # because I wasn't sure my pc could handle processing both simultaneously
+  future::plan(multiprocess, workers = 10)
+  performance_measures_lgo <- future_imap(lgo_cv_fits, safely(cv_assess), 
+                                          .progress = FALSE)  # change this if curious like me
+  future::plan(sequential)
+  saveRDS(performance_measures_lgo,
+          str_glue("{output_dir}/lgo_cv_performance_measures.rds"))
+} else {
+  performance_measures_lgo <- readRDS(
+    str_glue("{output_dir}/lgo_cv_performance_measures.rds")
+  )
+}
+```
+
+
+```{r lgo_plot, fig.width=12, fig.height=6, fig.cap=figure10_caption}
+figure10_caption <- "Figure 10. Leave-one-group-out cross validation."
+
+lgo_cv_results <- join_cv_folds(performance_measures = performance_measures_lgo,
+                                cv_type = "lgo")
+
+lgo_plot <- lgo_cv_results$.errors %>%
+  pivot_longer(cols = expec_malr:chp_somers) %>%
+  mutate(
+    .bounded = ifelse(
+      name %in% unbounded_metrics,
+      "Unbounded metrics", "Bounded metrics"
+    ),
+    name = factor(as.character(name),
+                  levels = names(.labels),
+                  labels = .labels),
+    value_original = value,
+    value = ifelse(value < 10, value, 10),
+    bacteria = factor(as.character(bacteria), 
+                      levels = bacs)
+  )  %>%
+  ggplot(aes(name, value)) +
+  geom_hline(yintercept = 1, linetype = "longdash",
+             alpha = .3) +
+  geom_boxplot(outlier.color = NA) +
+  geom_point(aes(fill = bacteria), 
+             pch = 21, size = 3,
+             position = position_dodge(width = .5)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.position = 'right',
+    legend.key.size = unit(.9, 'cm'),
+    legend.text = element_text(face = "bold", color = "gray40", size = 12),
+    strip.text = element_text(face = "bold", color = "gray20", size = 14)
+  ) +
+  labs(x = NULL, fill = NULL, y = NULL, color = NULL) +
+  facet_wrap(~ .bounded, scales = "free", nrow = 2) +
+  ggrepel::geom_text_repel(data = . %>% filter(value == 10),
+                           aes(label = round(value_original, 2)),
+                           ylim = 9.5, seed = SEED) +
+  scale_y_continuous(breaks = scales::pretty_breaks(5))
+
+lgo_plot
+```
+
+<br /><br />
+
+The model completely fails to classify abundance values for _B. cereus_. Yet, for other bacteria, ordinal association and classification accuracy varied between 0.9 and 0.6. Treated as a classification task, the poor predictive performance is likely influenced by high uncertainty associated with the estimation of varying intercepts and slopes using data from only five bacteria at each iteration. This can also explain the high coverage values: 95% predictive intervals were so wide that potentially spanned nearly all outcome space. On the other hand, the taxon associated with the worst out-of-sample performance (_B. cereus_) was also the one with the highest random effects in the original model, _i.e._, the greatest deviance from the overall, population-level effects - see Figure 4C. While most bacteria showed MAEr between 0.5 and 3, _B. cereus_ exceeded the value of 50 (absolute error as large as 50 times the true value). Nonetheless, MALR still varied below the threshold of 1 for all but _B. cereus_, whose associated MALR value almost reached 2 (ratio of two orders of magnitude on the $log_{10}$ scale). It is clear that generalization in high-throughput settings is challenged by specific bacteria, such as _B. cereus_, which deviate greatly from overall profiles. Yet, prediction errors for most bacteria were shown to vary below one order of magnitude.
+
+
+### Test-set validation
+
+We perform one final model-validation step, which involves predicting new, unseen samples. What we did was holding out beforehand 10% of the dataset to use for such a task. The performance results are shown in Figure 11.
+
+<br />
+
+```{r test_set_validation, fig.width=11, fig.height=6, fig.cap=figure11_caption}
+
+figure11_caption <- "Figure 11. Performance of fitted model on test set."
+.preds <- map(bacs, get_predictions, .fit = fit, .test_data = df_test)
+# check get_performance method
+test_set_perf <- imap(.preds,
+                      ~ get_performance(.x, 
+                                        .test_data = df_test %>%
+                                          filter(bacteria == .y))) %>%
+  plyr::ldply(rbind) %>%
+  pivot_longer(cols = -.id) %>%
+  mutate(
+    .bounded = ifelse(
+      name %in% unbounded_metrics,
+      "Unbounded metrics", "Bounded metrics"
+    ),
+    name = factor(as.character(name),
+                  levels = names(.labels),
+                  labels = .labels),
+    .id = factor(as.character(.id),
+                 levels = bacs)
+  ) %>%
+  ggplot(aes(name, value)) +
+  geom_hline(yintercept = 1, linetype = "longdash",
+             alpha = .3) +
+  geom_boxplot(outlier.colour = NA) +
+  geom_point(aes(fill = .id), 
+             pch = 21, size = 3,
+             position = position_dodge(width = .5)) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(size = 12),
+    axis.text.y = element_text(size = 12),
+    legend.position = 'right',
+    legend.key.size = unit(.9, 'cm'),
+    legend.text = element_text(face = "bold", color = "gray40", size = 12),
+    strip.text = element_text(face = "bold", color = "gray20", size = 14)
+  ) +
+  labs(y = NULL, x = NULL, fill = NULL)  +
+  facet_wrap(~ .bounded, scales = "free", nrow = 2) +
+  scale_y_continuous(breaks = scales::pretty_breaks(5))
+
+test_set_perf
+```
+
+ The highest MAEr value observed was roughly 1.5 (_L. monocytogenes_), while all MALR values were kept below 0.5. _S. aureus_ seems to be the taxon with the least preformant profile, agreeing with CV results both in terms of bounded and unbounded metrics. Overall, the results indicate predictive errors remain far below the threshold of one order of mangitude, suggesting that NGS reads can indeed be highly predictive of absolute bacterial abundances. 
+
+<br /><br /><br /><br />
+
+
+```{r save_main_text_figs}
+
+# save main text figs
+if (isTRUE(REFIT)) {
+  .path <- "output/main_text_figures/fig3"
+check_dir(.path)
+saveRDS(posterior_check_bars_grouped, 
+        str_glue("{.path}/mixed_model_post_pred_check.rds"))
+.path <- "output/main_text_figures/fig4"
+check_dir(.path)
+saveRDS(kfold_plot,
+        str_glue('{.path}/mixed_model_kfold.rds'))
+saveRDS(test_set_perf,
+        str_glue('{.path}/mixed_model_test_set_performance.rds'))
+
+.path <- "output/main_text_figures/fig5"
+check_dir(.path)
+saveRDS(lgo_plot,
+        str_glue('output/supp_material/supp3_mixed_model/lgo_plot.rds'))
+}
+
+```
+
+## References

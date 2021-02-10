@@ -1,0 +1,8 @@
+	class	family	genus	kingdom	order	otu	phylum	species
+0	Bacilli	Bacillaceae	Bacillus	Bacteria	Bacillales	oligotype_1_248052	Firmicutes	
+1	Gammaproteobacteria	Enterobacteriaceae		Bacteria	Enterobacterales	oligotype_2_186383	Proteobacteria	
+2	Gammaproteobacteria	Enterobacteriaceae	Escherichia	Bacteria	Enterobacterales	oligotype_3_185220	Proteobacteria	Escherichia coli
+3	Bacilli	Listeriaceae	Listeria	Bacteria	Bacillales	oligotype_4_157850	Firmicutes	
+4	Bacilli	Enterococcaceae	Enterococcus	Bacteria	Lactobacillales	oligotype_5_119690	Firmicutes	Enterococcus faecalis
+5	Bacilli	Staphylococcaceae	Staphylococcus	Bacteria	Bacillales	oligotype_6_50013	Firmicutes	Staphylococcus aureus
+6	Bacilli	Staphylococcaceae	Staphylococcus	Bacteria	Bacillales	oligotype_7_25263	Firmicutes	Staphylococcus epidermidis

@@ -1,0 +1,558 @@
+---
+output: html_document
+bibliography: library.bib
+---
+
+```{r setup, include=FALSE}
+working_dir = '~/workstation/projetos/lib_size'
+knitr::opts_knit$set(
+  root.dir = normalizePath(working_dir)
+) 
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  eval=TRUE
+)
+Sys.setlocale("LC_TIME", "C")
+```
+
+
+
+```{css echo=FALSE}
+body {
+  text-align: justify
+}
+
+p {
+  text-indent: rem;
+}
+.today {
+  position: relative;
+  left: 75%;
+  top: 20px;
+  font-size: 20px;
+}
+h1 {
+  text-align: center;
+}
+# header {
+position: relative;
+top: 500px;
+}
+```
+
+<p class="today">`r format(Sys.time(), '%B, %Y')`</p>
+
+<br /><br />
+
+<div>
+
+<center>
+<h1>
+Supplementary Material 1: Using Data from Multiple Sequencing Runs
+</h1>
+</center>
+
+<br />
+
+## Multiple Sequencing Correction (Normalization)
+
+One of the main challenges regarding the application of NGS technology is the variability of data generated in different sequencing runs, i.e., between-sequencing variation can be significantly driven by batch effects [@Robasky2014]. For any given set of samples, different runs commonly yield varying library sizes, even if the runs are performed under equivalent conditions. More importantly, in this case, the number of reads made available _a priori_ (expected sample coverage, a measure of relative availability) may vary by significant amounts. One can control such effects, however, while assuming the availability of reads as an upper bound sufficient to exhaust the given libraries - there are more than enough reads available to extract virtually all sample information. Such an assumption is commonly met for samples with low/medium microbe biomass, _e.g._, hospital microbiome samples with an expected coverage of at least 30000 reads/sample. Otherwise, one must either dilute samples or adjust analysis accordingly.
+
+The correction procedure herein proposed employs a size factor proportional to the expected sample coverage of reads set _before_ each sequencing run, representing the relative availability defined for the pool of interest. While we still call this a normalization (in the sense on rendering a set of samples comparable), notice it is markedly different in nature and purpose from procedures such as those implemented in DESeq2 within the context of differential abundance analysis - neither it is a transformation in the same sense as the ones proposed by compositional data analysis (_e.g._ centered log-ratio). Rather, we merely scale counts up when using data from pools whose expected sample coverage is not equal to the maximum counterpart within a single data set. By keeping such a parameter constant, this procedure is totally negligible even when using data from multiple sequencing runs.
+
+### Size Factor and Scaling
+
+Suppose we have data from multiple sequencing runs with which we want to estimate absolute abundances. In each of the runs, we process a _pool_ $p$ of $n$ samples of interest, and the final dataset is a collection of these. Not every pool has the same expected sample coverage. Hence, the normalization proposed is a function of the raw sequenced reads obtained in each run rescaled by a size factor dependent on their relative availability before the sequencing.
+
+$$K^{norm}_{i, j\in{D}} = \frac{K_{i,j\in{D}}}{S_{i,j\in{D}}}$$
+
+Here, $K^{norm}_{i, j\in{D}}$ denotes the normalized counts for the taxonomy $i$ sample $j\in{D}$, where $D$ is the set of samples from the $d^{th}$ sequencing run. The size factor is sequencing-specific (i.e., $S_{i,j\in{D}} = S_{d}$) and is calculated as follows: 
+
+$$S_{i,j\in{D}} = S_{d} = \frac{\overline{A_{p^*, d}}}{ \max_\limits{d^{\prime} = 1,2,...,m}(\overline{A_{p^*, d^\prime}})}$$
+where  $\overline{A_{p^*, d}}$ is the expected sample coverage in the pool of interest $p^\star$ within sequencing $d$. The lower the relative availability, the smaller the resulting factor and thus greater the normalized values relative to the raw counts. This is important because there are cases in which not every pool has the same number of reads per sample available, which hampers comparability in terms of absolute abundance. Once normalized, divergences across samples from different sequencing runs, but of similar bacterial abundances, are assumed to arise mostly from sequencing efficiency differences - yet of negligible order of magnitude in the scenario of varying biomass. Figure 1 illustrates the normalization effect on experimental data of known abundances from four sequencing runs. In this experiment, each run sequenced the same set of libraries, but with varying expected sample coverage (progressively decreasing from run 1 to run 4).
+
+<br />
+
+
+```{r figure1_functions}
+source('code/R/general_functions.R')
+library(patchwork)
+# other dependencies: scales, ggpubr
+
+plot_seq_cov <- function(df, .y, .seq_group, .fill = 'viridis') {
+  df <- df %>%
+    select({{.seq_group}}, {{.y}}) %>%
+    unique()
+  n_seqs <- n_distinct(
+    df[[as_name(enquo(.seq_group))]]
+  )
+  p <- df %>%
+    ggplot(aes({{.seq_group}}, {{.y}}, fill = {{.seq_group}})) +
+    geom_col() +
+    scale_x_discrete(labels = paste0('Seq ', 1:n_seqs)) +
+    labs(
+      x = 'Sequencing Run',
+      y = 'Sequencing Depth',
+      fill = 'Run'
+    ) +
+    theme(
+      axis.text.x = element_text(
+        angle = 45,
+        hjust = 1
+      ),
+      axis.title = element_text(
+        face = 'bold',
+        color = 'gray20',
+        size = 14
+      )
+    ) 
+  if (.fill == 'viridis') {
+    p <- p +
+      scale_fill_viridis_d()
+  } else if (.fill == 'Dark2') {
+    p <- p +
+      scale_fill_brewer(palette = 'Dark2')
+  } else {
+    stop('Go grab a coffee, 2 options is enough.')
+  }
+  
+  return(p)
+  
+}
+
+plot_afo_cfu <- function(.df, .x, .y, .title, .color, .pseudo_count=0,
+                         .type = 'original', .dir = 'images',
+                         .ylim=c(.9, 1e5), .linewidht=c(6.9e4, 6.5e4),
+                         .save=TRUE) {
+  .y = enquo(.y)
+  set.seed(28356)
+  # plot.roof = max(df[[as.character(quo_get_expr(.y))]])
+  if (.type == 'original') {
+    plot.params = list(
+      scale_x_log10(breaks = 0.84 * 10^(2:6),
+                    labels = scales::scientific(0.84 * 10^(2:6))),
+      scale_y_log10(
+        breaks = 10^seq(0,5, 1),
+        labels = scales::trans_format("log10", 
+                                      scales::math_format(10^.x))
+      ),
+      labs(x = 'Microbial Load (cfu)', 
+           y = .title, color = NULL),
+      theme_bw(),
+      theme(
+        legend.position = 'right',
+        axis.text = element_text(color = 'gray40', size = 12, face = 'bold'),
+        axis.title = element_text(color = 'gray20', size = 13, face = 'bold'),
+        legend.text = element_text(face = 'bold', size = 12)
+      ),
+      scale_color_brewer(palette = 'Dark2'),
+      guides(
+        colour = guide_legend(
+          override.aes = list(size = 6)
+        )
+      )
+    )
+    
+    
+  } else if (.type == 'proportions') {
+    plot.params = list(
+      scale_x_log10(breaks = c(0.1, 2e0, 2e1, 2e2, 2e3, 2e4, 2e5),
+                    labels = c('0', paste0('2e+', 0:5))),
+      scale_y_continuous(limits = .ylim,
+                         breaks = c(0,.1,.2,.3),
+                         labels = c('0','10', '20', '30')),
+      scale_brewer_neopct(type = 'color', n = 3),
+      geom_rect(aes(color = NULL, xmin = 7e3, xmax = 7e5, 
+                    ymin = .26, 
+                    ymax = .265),
+                fill = 'gray40', alpha = .1),
+      annotate('text', x = 7.7e4, y = .28,
+               fontface = 'bold', label = 'saturation?'),
+      geom_hline(yintercept = .14, linetype = 2, 
+                 color = 'gray40', size = 1.2, alpha = .6),
+      annotate('text', x = 2e1, y = .155,
+               color = 'gray30',
+               hjust = 1, fontface = 'bold',
+               label = 'True value: 14 %'),
+      labs(x = 'Microbial Load (cfu)', 
+           y = .title, color = NULL),
+      theme(legend.position = 'right',
+            axis.text = element_text(color = 'gray40', size = 11, 
+                                     face = 'bold'),
+            axis.title = element_text(color = 'gray20', size = 13, 
+                                      face = 'bold'))
+    )
+    
+    
+  } else {
+    stop('.type must be either "raw" or "proportions".')
+  }
+  p <-
+    .df %>%
+    ggplot(aes({{.x}}, !! .y + .pseudo_count, color = {{.color}})) +
+    geom_point(position = position_dodge(width = .3)) +
+    geom_smooth(aes(group = 1), method = 'lm', 
+                formula = y ~ poly(x, 3), color = 'red') +
+    plot.params
+  
+  p = ggpar(p, ylim = .ylim)
+  
+  if (.save) {
+    
+    if (!dir.exists(.dir)) dir.create(.dir, recursive = TRUE)
+    
+    file_name = str_replace(.title,'\n',' ') %>%
+      str_remove_all('\\)|\\(|%|-') %>%
+      str_replace_all(' ', '_') %>%
+      str_replace_all('\\+_1', 'plus_one') %>%
+      str_replace_all('_+', '_') %>%
+      str_replace_all('_+', '_')
+    
+    
+    file_name = str_glue('{.dir}/{file_name}_{.type}.png')
+    print(file_name)
+    ggsave(file_name, p,
+           width = 8.5, height = 5.2)
+  }
+  return(p)
+}
+
+```
+
+```{r load_data}
+ISSUE <- "data_normalization"
+output_dir <- str_glue("output/supp_material/{ISSUE}")
+check_dir(output_dir)
+theme_set(theme_pubr())
+
+phylo <- readRDS('data/normalized/phyloseq.rds')
+```
+
+
+```{r figure1_plot, fig.width=12.5, fig.height=8.3,fig.cap=figure1_caption}
+
+figure1_caption = "Figure 1. Effect of data normalization."
+
+df <- data.frame(phylo@sam_data)
+
+p_raw <- plot_afo_cfu(
+  df,
+  .x = total_cfu, .color = seq_id,
+  .y = lib_size_raw + 1, .save = F,
+  .title = 'Library Size (# reads + 1)',
+  .ylim = c(1e0, 1e5),
+  .linewidht = c(0.9e5, 1e5)
+) + ggtitle('Raw')
+
+p_norm <- plot_afo_cfu(
+  df,
+  .x = total_cfu, .color = seq_id,
+  .y = lib_size + 1, .save = F,
+  .title = 'Library Size (# reads + 1)',
+  .ylim = c(1e0, 1e5),
+  .linewidht = c(0.9e5, 1e5)
+) + ggtitle('Normalized')
+
+p_raw_cov <- plot_seq_cov(
+  df, .y = seq_depth,
+  .seq_group = seq_id,
+  .fill = 'Dark2'
+) + ggtitle('Raw')  +
+  guides(
+    colour = guide_legend(
+      override.aes = list(size=6)
+    )
+  ) +
+  theme(
+    legend.text = element_text(face = 'bold', size = 12)
+  ) 
+
+p_norm_cov <- plot_seq_cov(
+  df %>% mutate(seq_depth = seq_depth / size_factor),
+  .y = seq_depth,
+  .seq_group = seq_id,
+  .fill = 'Dark2'
+) + ggtitle('Normalized') +
+  guides(
+    colour = guide_legend(
+      override.aes = list(size=6)
+    )
+  ) +
+  theme(
+    legend.text = element_text(face = 'bold', size = 12)
+  )
+
+plot_lib_sizes_cfu <- ggarrange(
+  p_raw,
+  p_norm ,
+  p_raw_cov,
+  p_norm_cov,
+  ncol = 2, nrow = 2, 
+  common.legend = TRUE,
+  labels = 'AUTO'
+)
+plot_lib_sizes_cfu_log2 <- ggarrange(
+  p_raw + yscale('log2', .format = TRUE) + xscale('log2', .format = TRUE),
+  p_norm + yscale('log2', .format = TRUE) + xscale('log2', .format = TRUE),
+  p_raw_cov,
+  p_norm_cov,
+  ncol = 2, nrow = 2, 
+  common.legend = TRUE,
+  labels = 'AUTO' 
+)
+
+check_dir("output/supp_material/supp1_data_normalization")
+ggsave('output/supp_material/supp1_data_normalization/fig1.png',
+       plot_lib_sizes_cfu, width = 13, height = 8)
+ggsave('output/supp_material/supp1_data_normalization/supp_fig1.png',
+       plot_lib_sizes_cfu_log2, width = 13, height = 8)
+plot_lib_sizes_cfu
+
+```
+
+<br />
+
+Figure 1A suggests that the proportionality between microbial load and observed counts is still present regardless of the variation in expected sample coverage across sequencing runs. After the correction, Figure 1B indicates that samples from runs with lower expected coverages were scaled up, rendering the entire data set readily comparable. Notice the third-order polynomial relationship is fit at the log10 scale, even though similar results were observed at the log2 scale (not shown). The former option was preferred mostly because of interpretability: in classical microbiology, log10 is the most common working scale and CFU quantification can be related to orders of magnitude accordingly. The logarithmic transformation also stabilizes variance, addressing issues associated with heteroskedasticity of NGS data.
+
+Beyond such controlled experiments, however, it remains unclear whether the proposed procedure is incapable of fabricating artificial differences. To further validate our approach, we investigated the effect of normalization on a pool of samples sequenced repeatedly in 10-14 different runs from a real hospital environment. Hospital microbiome samples were collected from a Brazillian hospital under the Healthcare-associated Infections Microbiome Project (HAIMP, ethics approval number 32930514.0.0000.0121) [@Sereia2018]. Samples (n=180) were collected in April 2015 from Intensive Care Units, Surgical Wards, Internal Medicine Ward, General Surgery Unit, and Emergency room. Bacterial DNA was extracted from samples using a thermal lysis protocol along with posterior AMPure XP magnetic beads (Beckman Coulter, CA, USA). Figure 2 shows the comparison between raw and normalized data.
+
+<br />
+
+```{r figure2, fig.width=12, fig.height=8, fig.cap=figure2_caption}
+figure2_caption = "Figure 2. Normalization effects."
+# load and process 14-seq data
+phylo.raw <- readRDS('data/raw/phyloseq_raw_data.rds')
+
+otus <- "data/raw/repetition_14_runs/190607-212052/otu_table_count_neorefdb16sv6.tsv"
+tax <- "data/raw/repetition_14_runs/190607-212052/tax_table_neorefdb16sv6.tsv"
+meta <- "data/raw/repetition_14_runs/metadata_14_seqs.tsv"
+
+phylo14 <- load_phyloseq(otutable = otus, 
+                         metadata = meta,
+                         meta_smpls_only = TRUE,
+                         remove_zeros = c("samples", "taxa"),
+                         bacteria_only = TRUE,
+                         taxtable = tax,
+                         treefile = NULL,
+                         speciesonly = F,
+                         taxa_as_rows = F)
+phylo14@sam_data$lib_size_raw <- sample_sums(phylo14)
+smpl_data <- data.frame(phylo14@sam_data) %>%
+  mutate(size_factor = Mean_Sample_Cov / max(Mean_Sample_Cov),
+         sample_prefix = str_extract(sample, '\\w+')) %>%
+  as.data.frame(row.names = paste0("Smpl", .$sample))               # TODO: check this please
+otu_data <- phylo14@otu_table@.Data
+otu_normalized <- otu_data / smpl_data$size_factor
+phylo14.norm <- phylo14
+sample_data(phylo14.norm) <- smpl_data
+otu_table(phylo14.norm) <- otu_table(
+  otu_normalized,
+  taxa_are_rows = FALSE
+)
+phylo14.norm@sam_data$lib_size <- sample_sums(phylo14.norm)
+
+# normalization effects
+
+cutoff <- 10
+mydata <- left_join(
+  phylo14@sam_data %>%
+    data.frame() %>% 
+    mutate(sample_prefix = str_extract(sample, '\\d+')) %>% 
+    select(sample, sample_prefix, lib_size_raw),
+  phylo14.norm@sam_data %>% 
+    data.frame() %>% 
+    mutate(sample_prefix = str_extract(sample, '\\d+')) %>% 
+    select(sample, sample_prefix, lib_size),
+  by = 'sample'
+) %>% 
+  mutate(
+    lib_size = log10(lib_size),
+    lib_size_raw = log10(lib_size_raw)
+  ) %>%
+  group_by(sample_prefix.x) %>%
+  mutate(n = n()) %>%
+  filter(n >= cutoff) %>%
+  summarise(
+    variation_raw = sd(lib_size_raw) / mean(lib_size_raw),
+    variation_norm = sd(lib_size) / mean(lib_size),
+    var_diff = (variation_raw ) / (variation_norm )
+  )
+mydata %>%
+  ggplot(aes(reorder(sample_prefix.x, -var_diff), var_diff)) +
+  geom_point() +
+  geom_hline(yintercept = 1, linetype = 'longdash', color = 'gray40') +
+  labs(y = "CV ratio\n Raw / Normalized", x = "Samples"
+  ) +
+  annotate('text', x = 60, y = 3.5, 
+           label= str_glue('{nrow(mydata)} unique samples\nAt least {cutoff} runs per sample'),
+           hjust = 0, fontface = 'bold', color = 'gray40') +
+  theme(axis.text.x = element_blank()) -> cv_comparison_14seqs
+
+
+ggsave('output/supp_material/supp1_data_normalization/libsize_cv_comparison_14seqs.png',
+       cv_comparison_14seqs, width = 9, height = 5.5)
+
+mydata %>%
+  pivot_longer(cols = contains('variation')) %>%
+  mutate(name = factor(
+    c(
+      "variation_raw" = "Raw",
+      "variation_norm" = "Normalized"
+    )[as.character(name)],
+    levels = c('Raw', 'Normalized')
+  )
+  ) %>%
+  ggplot(aes(name, value * 100, fill = name, color = name)) +
+  geom_jitter(alpha=.3, show.legend = FALSE) +
+  geom_boxplot(alpha = .2, outlier.colour = 'black',size=1) +
+  ggpubr::stat_compare_means(show.legend = FALSE, paired = TRUE) +
+  geom_hline(yintercept = 5, alpha = .8,
+             linetype = 'longdash',
+             color = 'gray40') +
+  annotate('text', x = 1.1, y = 58,
+           label = str_glue("N = {nrow(mydata)}")) + 
+  labs(y = "Coefficient of Variation (%)",
+       x = NULL, fill = NULL,
+       color = NULL, fill = NULL) +
+  guides(fill='none') +
+  scale_y_continuous(
+    limits = c(0, 65),
+    breaks = c(
+      seq(0, 20, 5),
+      seq(30, 70, 10)
+    )) -> cv_comparison_14seqs2
+
+mydata %>%
+  pivot_longer(cols = contains('variation')) %>%
+  mutate(name = factor(
+    c(
+      "variation_raw" = "Raw",
+      "variation_norm" = "Normalized"
+    )[as.character(name)],
+    levels = c('Raw', 'Normalized')
+  )
+  ) %>%
+  ggplot(aes(name, value * 100, fill = name, color = name)) +
+  geom_point(alpha=.3, show.legend = FALSE) +
+  ggpubr::stat_compare_means(show.legend = FALSE, paired = TRUE) +
+  annotate('text', x = 1.1, y = 58,
+           label = str_glue("N = {nrow(mydata)}")) + 
+  labs(y = "Coefficient of Variation (%)",
+       x = NULL, fill = NULL,
+       color = NULL, fill = NULL) +
+  guides(fill='none') +
+  scale_y_continuous(
+    limits = c(0, 65),
+    breaks = c(
+      seq(0, 20, 5),
+      seq(30, 70, 10)
+    )) +
+  geom_line(aes(group=sample_prefix.x),
+            color = 'gray20',
+            alpha = .2) +
+  geom_boxplot(alpha = .2, outlier.colour = 'black',size=1) +
+  geom_hline(yintercept = 5, alpha = .8,
+             linetype = 'longdash',
+             color = 'gray20') -> cv_comparison_14seqs3
+# not sure which one is better, although the third plot does show the consistent decrease of CV
+ggsave('output/supp_material/supp1_data_normalization/libsize_cv_comparison_14seqs.png',
+       cv_comparison_14seqs3, width = 7, height = 5.5)
+cv_plots <- cv_comparison_14seqs + cv_comparison_14seqs3 + plot_layout(widths = c(.7, .3))
+
+## alpha divs
+
+alpha_14seqs_raw <- estimate_richness(phylo14, measures = c("shannon", "invsimpson")) %>%
+  mutate(.sample = rownames(.))
+alpha_14seqs_norm <- estimate_richness(phylo14.norm, measures = c("shannon", "invsimpson")) %>%
+  mutate(.sample = rownames(.))
+
+alpha_div_comparison <- left_join(
+  alpha_14seqs_raw,
+  alpha_14seqs_norm,
+  by = '.sample',
+  suffix = c("Raw", "Normalized")
+) %>%
+  pivot_longer(
+    cols = c(contains('Shannon'), contains('InvSimpson'))
+  ) %>%
+  mutate(
+    type = str_extract(name, "Raw|Normalized"),
+    name = str_extract(name, "Shannon|InvSimpson")
+  ) %>%
+  pivot_wider(
+    id_cols = c(".sample", "name"),
+    names_from = type,
+    values_from = value
+  ) %>%
+  ggplot(aes(Raw, Normalized)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  facet_wrap(~name, scales = "free", nrow = 2) +
+  theme(strip.text = element_text(face = 'bold', size = 12))
+
+obs_pool_coverage <- left_join(
+    phylo14@sam_data %>%
+        data.frame() %>% 
+        mutate(lib_size_raw = sample_sums(phylo14), type = 'Raw') %>%
+        group_by(seq) %>%
+        mutate(seq_cov_raw = sum(lib_size_raw)) %>%
+        ungroup(),
+    phylo14.norm@sam_data %>%
+        data.frame() %>% 
+        mutate(lib_size = sample_sums(phylo14.norm), type = 'Normalized') %>%
+        group_by(seq) %>%
+        mutate(seq_cov_norm = sum(lib_size)) %>%
+        ungroup(),
+    by = 'sample'
+) %>%
+    select(seq.x, seq.y, contains('seq_cov')) %>%
+    unique() %>%
+    pivot_longer(
+        cols = contains('seq_cov')
+    ) %>%
+    mutate(
+        seq.x = factor(
+            as.character(seq.x),
+            levels = paste0("seq", 1:14)
+        ),
+        name = factor(
+            c('seq_cov_norm' = 'Normalized',
+              'seq_cov_raw' = 'Raw')[as.character(name)],
+            levels = c("Raw", "Normalized")
+        )
+    ) %>%
+    ggplot(aes(seq.x, value, fill=seq.x)) +
+    geom_col() +
+    facet_wrap(~ name, nrow = 2) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_log10(limits = c(1e5, 1e7), 
+                  breaks = 10^seq(5, 7, 1),
+                  oob = scales::rescale_none) +
+    scale_fill_viridis_d() +
+    theme(strip.text = element_text(face = 'bold', size = 12)) +
+    labs(x = "Sequencing Run",
+         y = "Observed pool coverage",
+         fill = NULL) +
+    guides(fill='none')
+
+ggarrange(
+  obs_pool_coverage, alpha_div_comparison, cv_comparison_14seqs, cv_comparison_14seqs3,
+  widths = c(.7, .3),
+  labels = 'AUTO',
+  nrow = 2,
+  ncol = 2
+)
+```
+
+<br />
+
+In this experiment, the same pool of samples was sequenced in repeated runs (up to 14 times, samples with zero counts were excluded) so that there should be no consistent biological differences across observed pools. Expected sample coverages varied widely (from 60000 to 7891 reads per sample). 
+
+  The observed pool coverage (Figure 2A) showed little variation even in the raw data, being virtually unaffected after normalization. Figure 2B demonstrates that the procedure does not affect proportion-based metrics such as alpha diversity (red line marks the identity, where $y = x$). Noteworthy, however, is the effect of normalization on sample-wise variability. Using samples sequenced at least 10 times, we computed the coefficient of variation $CV_j = \frac{\hat\sigma_j}{\hat\mu_j}$ of library sizes for each sample $j$, before and after normalizing. Figures  2C and 2D show that normalized data consistently diminished variability, up to a 4:1 ratio, and brought the median CV down to a 5% level. 
+
+<br /><br /><br /><br /><br />
+
+# References
+
