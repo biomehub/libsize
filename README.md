@@ -5,7 +5,7 @@ output:
 ---
 # Equivolumetric protocol generates library sizes proportional to total microbial load in 16S amplicon sequencing
 
-Repository with data and code for the analyses involved in the corresponding manuscript (https://doi.org/10.1101/2020.02.03.932301). 
+Repository with data and code for the analyses involved in the corresponding manuscript (https://doi.org/10.3389/fmicb.2021.638231). 
 
 * All Supplementary Materials .Rmd files use `data/normalized/phyloseq.rds` as primary input. 
 * Within each .Rmd file, you will need to set the variable `REFIT = TRUE` in order to fit the models and save corresponding (quite big) .rds files.
