@@ -19,6 +19,7 @@ Figure 1 was made by hand :)
 # Fig 2
 set.seed(13528)
 fig2a <- readr::read_tsv("data/raw/dna_concentrations/dna_concentration_data.tsv") %>%
+  rename(dna_concentration := `dna_concentration(ng/uL)`) %>% 
   ggplot(aes(dna_concentration, ngs_reads + 1)) +
   geom_boxplot(aes(group = factor(dna_concentration)), color = 'gray40', alpha = 0) + 
   geom_jitter(height = 0, width = .2, size = 2) +
