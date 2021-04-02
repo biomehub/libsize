@@ -1,4 +1,4 @@
-sample	dna_copies	ngs_reads	dna_concentration
+sample	dna_copies	ngs_reads	dna_concentration(ng/uL)
 190624600121.1.1.1	954000000	83711	0.56
 190624600122.1.1.1	954000000	55831	0.56
 190624600123.1.1.1	954000000	38183	0.56
